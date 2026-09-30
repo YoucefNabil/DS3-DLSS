@@ -16,6 +16,9 @@
 #include "camera/scene_camera.h"
 #include "common/log.h"
 #include "dlss/dlaa.h"
+#include "dlss/mip_bias.h"
+#include "dlss/object_motion.h"
+#include "dlss/reactive.h"
 #include "hooks/frame_dump.h"
 #include "hooks/shader_registry.h"
 #include "hooks/vtable_indices.h"
@@ -60,18 +63,27 @@ CreateVertexShaderFn o_CreateVertexShader;
 CreatePixelShaderFn o_CreatePixelShader;
 CreateComputeShaderFn o_CreateComputeShader;
 CreateDeferredContextFn o_CreateDeferredContext;
+using CreateSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_SAMPLER_DESC*,
+                                                         ID3D11SamplerState**);
+CreateSamplerStateFn o_CreateSamplerState;
 
 HRESULT STDMETHODCALLTYPE Hk_CreateVertexShader(ID3D11Device* self, const void* code, SIZE_T len,
                                                 ID3D11ClassLinkage* linkage, ID3D11VertexShader** out) {
   const HRESULT hr = o_CreateVertexShader(self, code, len, linkage, out);
-  if (SUCCEEDED(hr) && out) shaders::Register(*out, code, len, "vs");
+  if (SUCCEEDED(hr) && out) {
+    shaders::Register(*out, code, len, "vs");
+    object_motion::OnVertexShaderCreated(*out, code, len, shaders::HashBytecode(code, len));
+  }
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hk_CreatePixelShader(ID3D11Device* self, const void* code, SIZE_T len,
                                                ID3D11ClassLinkage* linkage, ID3D11PixelShader** out) {
   const HRESULT hr = o_CreatePixelShader(self, code, len, linkage, out);
-  if (SUCCEEDED(hr) && out) shaders::Register(*out, code, len, "ps");
+  if (SUCCEEDED(hr) && out) {
+    shaders::Register(*out, code, len, "ps");
+    object_motion::OnPixelShaderCreated(*out, shaders::HashBytecode(code, len));
+  }
   return hr;
 }
 
@@ -83,10 +95,43 @@ HRESULT STDMETHODCALLTYPE Hk_CreateComputeShader(ID3D11Device* self, const void*
   return hr;
 }
 
+// Creates the mip-biased twin next to each sampler that uses mips (see
+// dlss/mip_bias.h). The game only ever sees its own sampler.
+HRESULT STDMETHODCALLTYPE Hk_CreateSamplerState(ID3D11Device* self, const D3D11_SAMPLER_DESC* desc,
+                                                ID3D11SamplerState** out) {
+  const HRESULT hr = o_CreateSamplerState(self, desc, out);
+  D3D11_SAMPLER_DESC biased;
+  if (SUCCEEDED(hr) && desc && out && *out && mip_bias::WantsTwin(*desc, &biased)) {
+    ID3D11SamplerState* twin = nullptr;
+    if (SUCCEEDED(o_CreateSamplerState(self, &biased, &twin)) && twin) {
+      mip_bias::Register(*out, twin);
+      twin->Release();
+    }
+  }
+  return hr;
+}
+
 // ---- ID3D11DeviceContext -------------------------------------------------
 // Instantiated once for the immediate context (0) and once for deferred
 // contexts (1), in case d3d11.dll implements them with different code.
 
+using VSSetShaderFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11VertexShader*,
+                                               ID3D11ClassInstance* const*, UINT);
+using PSSetShaderFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11PixelShader*,
+                                               ID3D11ClassInstance* const*, UINT);
+using PSSetSamplersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
+                                                 ID3D11SamplerState* const*);
+using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+                                                      ID3D11RenderTargetView* const*,
+                                                      ID3D11DepthStencilView*);
+using OMSetRenderTargetsAndUavsFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT,
+    UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+using OMSetBlendStateFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11BlendState*,
+                                                   const FLOAT[4], UINT);
+using OMSetDepthStencilStateFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,
+                                                          ID3D11DepthStencilState*, UINT);
+using ClearStateFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*);
 using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
@@ -120,6 +165,14 @@ using UpdateSubresource1Fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3
 
 template <int Instance>
 struct ContextHooks {
+  static inline VSSetShaderFn o_VSSetShader;
+  static inline PSSetShaderFn o_PSSetShader;
+  static inline PSSetSamplersFn o_PSSetSamplers;
+  static inline OMSetRenderTargetsFn o_OMSetRenderTargets;
+  static inline OMSetRenderTargetsAndUavsFn o_OMSetRenderTargetsAndUavs;
+  static inline OMSetBlendStateFn o_OMSetBlendState;
+  static inline OMSetDepthStencilStateFn o_OMSetDepthStencilState;
+  static inline ClearStateFn o_ClearState;
   static inline DrawFn o_Draw;
   static inline DrawIndexedFn o_DrawIndexed;
   static inline DrawInstancedFn o_DrawInstanced;
@@ -137,22 +190,95 @@ struct ContextHooks {
   static inline UpdateSubresourceFn o_UpdateSubresource;
   static inline UpdateSubresource1Fn o_UpdateSubresource1;
 
+  static void STDMETHODCALLTYPE VSSetShader(ID3D11DeviceContext* self, ID3D11VertexShader* vs,
+                                            ID3D11ClassInstance* const* instances, UINT count) {
+    object_motion::OnSetVertexShader(self, vs);
+    o_VSSetShader(self, vs, instances, count);
+  }
+
+  static void STDMETHODCALLTYPE PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps,
+                                            ID3D11ClassInstance* const* instances, UINT count) {
+    object_motion::OnSetPixelShader(self, ps);
+    o_PSSetShader(self, ps, instances, count);
+  }
+
+  static void STDMETHODCALLTYPE PSSetSamplers(ID3D11DeviceContext* self, UINT start, UINT count,
+                                              ID3D11SamplerState* const* samplers) {
+    ID3D11SamplerState* scratch[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    o_PSSetSamplers(self, start, count, mip_bias::Substitute(count, samplers, scratch));
+  }
+
+  // Output-merger state, for the reactive mask (see dlss/reactive.h).
+  static void STDMETHODCALLTYPE OMSetRenderTargets(ID3D11DeviceContext* self, UINT count,
+                                                   ID3D11RenderTargetView* const* rtvs,
+                                                   ID3D11DepthStencilView* dsv) {
+    reactive::OnSetRenderTargets(self, count, rtvs);
+    o_OMSetRenderTargets(self, count, rtvs, dsv);
+  }
+
+  static void STDMETHODCALLTYPE OMSetRenderTargetsAndUavs(
+      ID3D11DeviceContext* self, UINT count, ID3D11RenderTargetView* const* rtvs,
+      ID3D11DepthStencilView* dsv, UINT uav_start, UINT uav_count,
+      ID3D11UnorderedAccessView* const* uavs, const UINT* initial_counts) {
+    if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+      reactive::OnSetRenderTargets(self, count, rtvs);
+    o_OMSetRenderTargetsAndUavs(self, count, rtvs, dsv, uav_start, uav_count, uavs,
+                                initial_counts);
+  }
+
+  static void STDMETHODCALLTYPE OMSetBlendState(ID3D11DeviceContext* self, ID3D11BlendState* blend,
+                                                const FLOAT factor[4], UINT mask) {
+    reactive::OnSetBlendState(self, blend);
+    o_OMSetBlendState(self, blend, factor, mask);
+  }
+
+  static void STDMETHODCALLTYPE OMSetDepthStencilState(ID3D11DeviceContext* self,
+                                                       ID3D11DepthStencilState* state, UINT ref) {
+    reactive::OnSetDepthStencilState(self, state);
+    o_OMSetDepthStencilState(self, state, ref);
+  }
+
+  static void STDMETHODCALLTYPE ClearState(ID3D11DeviceContext* self) {
+    reactive::OnResetState(self);
+    o_ClearState(self);
+  }
+
+  // Draws after the game's own: motion-blur velocity draws are repeated into
+  // the full-resolution object-motion target (see dlss/object_motion.h). The
+  // blur draws themselves are skipped while hidden.
   static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* self, UINT vertices, UINT start) {
     dlaa::BeforeDraw(self);
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "Draw", vertices, 1);
+    if (object_motion::SkipDraw(self)) return;
     o_Draw(self, vertices, start);
+    if (object_motion::WantsRedraw(self))
+      object_motion::Redraw(self, [&] { o_Draw(self, vertices, start); });
+    if (reactive::WantsRedraw(self))
+      reactive::Redraw(self, [&] { o_Draw(self, vertices, start); });
   }
 
   static void STDMETHODCALLTYPE DrawIndexed(ID3D11DeviceContext* self, UINT indices, UINT start,
                                             INT base) {
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "DrawIndexed", indices, 1);
+    if (object_motion::SkipDraw(self)) return;
     o_DrawIndexed(self, indices, start, base);
+    if (object_motion::WantsRedraw(self))
+      object_motion::Redraw(self, [&] { o_DrawIndexed(self, indices, start, base); });
+    if (reactive::WantsRedraw(self))
+      reactive::Redraw(self, [&] { o_DrawIndexed(self, indices, start, base); });
   }
 
   static void STDMETHODCALLTYPE DrawInstanced(ID3D11DeviceContext* self, UINT vertices,
                                               UINT instances, UINT start, UINT start_instance) {
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "DrawInstanced", vertices, instances);
+    if (object_motion::SkipDraw(self)) return;
     o_DrawInstanced(self, vertices, instances, start, start_instance);
+    if (object_motion::WantsRedraw(self))
+      object_motion::Redraw(
+          self, [&] { o_DrawInstanced(self, vertices, instances, start, start_instance); });
+    if (reactive::WantsRedraw(self))
+      reactive::Redraw(
+          self, [&] { o_DrawInstanced(self, vertices, instances, start, start_instance); });
   }
 
   static void STDMETHODCALLTYPE DrawIndexedInstanced(ID3D11DeviceContext* self, UINT indices,
@@ -160,7 +286,16 @@ struct ContextHooks {
                                                      UINT start_instance) {
     if (frame_dump::Active())
       frame_dump::RecordDraw(self, "DrawIndexedInstanced", indices, instances);
+    if (object_motion::SkipDraw(self)) return;
     o_DrawIndexedInstanced(self, indices, instances, start, base, start_instance);
+    if (object_motion::WantsRedraw(self))
+      object_motion::Redraw(self, [&] {
+        o_DrawIndexedInstanced(self, indices, instances, start, base, start_instance);
+      });
+    if (reactive::WantsRedraw(self))
+      reactive::Redraw(self, [&] {
+        o_DrawIndexedInstanced(self, indices, instances, start, base, start_instance);
+      });
   }
 
   static void STDMETHODCALLTYPE Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
@@ -208,11 +343,13 @@ struct ContextHooks {
                                                    ID3D11CommandList* list, BOOL restore) {
     if (frame_dump::Active()) frame_dump::RecordExecuteCommandList(self, list);
     o_ExecuteCommandList(self, list, restore);
+    if (!restore) reactive::OnResetState(self);
   }
 
   static HRESULT STDMETHODCALLTYPE FinishCommandList(ID3D11DeviceContext* self, BOOL restore,
                                                      ID3D11CommandList** list) {
     const HRESULT hr = o_FinishCommandList(self, restore, list);
+    if (!restore) reactive::OnResetState(self);
     if (SUCCEEDED(hr) && list && *list && frame_dump::Active())
       frame_dump::RecordFinishCommandList(self, *list);
     return hr;
@@ -222,12 +359,15 @@ struct ContextHooks {
                                        D3D11_MAP type, UINT flags,
                                        D3D11_MAPPED_SUBRESOURCE* mapped) {
     const HRESULT hr = o_Map(self, r, sub, type, flags, mapped);
-    if (SUCCEEDED(hr) && mapped && frame_dump::Active())
-      frame_dump::RecordMap(self, r, type, mapped->pData);
+    if (SUCCEEDED(hr) && mapped) {
+      camera::OnMap(self, r, type, mapped->pData);
+      if (frame_dump::Active()) frame_dump::RecordMap(self, r, type, mapped->pData);
+    }
     return hr;
   }
 
   static void STDMETHODCALLTYPE Unmap(ID3D11DeviceContext* self, ID3D11Resource* r, UINT sub) {
+    camera::OnUnmap(self, r);
     if (frame_dump::Active()) frame_dump::RecordUnmap(self, r);
     o_Unmap(self, r, sub);
   }
@@ -257,6 +397,17 @@ struct ContextHooks {
       std::snprintf(name, sizeof(name), "%s::%s", kind, method);
       HookSlot(ctx, slot, detour, original, name);
     };
+    hook(kSlotCtx_VSSetShader, &VSSetShader, &o_VSSetShader, "VSSetShader");
+    hook(kSlotCtx_PSSetShader, &PSSetShader, &o_PSSetShader, "PSSetShader");
+    hook(kSlotCtx_PSSetSamplers, &PSSetSamplers, &o_PSSetSamplers, "PSSetSamplers");
+    hook(kSlotCtx_OMSetRenderTargets, &OMSetRenderTargets, &o_OMSetRenderTargets,
+         "OMSetRenderTargets");
+    hook(kSlotCtx_OMSetRenderTargetsAndUnorderedAccessViews, &OMSetRenderTargetsAndUavs,
+         &o_OMSetRenderTargetsAndUavs, "OMSetRenderTargetsAndUnorderedAccessViews");
+    hook(kSlotCtx_OMSetBlendState, &OMSetBlendState, &o_OMSetBlendState, "OMSetBlendState");
+    hook(kSlotCtx_OMSetDepthStencilState, &OMSetDepthStencilState, &o_OMSetDepthStencilState,
+         "OMSetDepthStencilState");
+    hook(kSlotCtx_ClearState, &ClearState, &o_ClearState, "ClearState");
     hook(kSlotCtx_Draw, &Draw, &o_Draw, "Draw");
     hook(kSlotCtx_DrawIndexed, &DrawIndexed, &o_DrawIndexed, "DrawIndexed");
     hook(kSlotCtx_DrawInstanced, &DrawInstanced, &o_DrawInstanced, "DrawInstanced");
@@ -330,9 +481,10 @@ bool GameHasFocus() {
 
 HRESULT STDMETHODCALLTYPE Hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
   static std::atomic<bool> logged_first{false};
+  DXGI_SWAP_CHAIN_DESC desc = {};
+  if (SUCCEEDED(self->GetDesc(&desc)))
+    camera::SetOutputSize(desc.BufferDesc.Width, desc.BufferDesc.Height);
   if (!logged_first.exchange(true)) {
-    DXGI_SWAP_CHAIN_DESC desc = {};
-    self->GetDesc(&desc);
     Log("first Present: %ux%u fmt=%d buffers=%u windowed=%d swap_effect=%d",
         desc.BufferDesc.Width, desc.BufferDesc.Height, desc.BufferDesc.Format, desc.BufferCount,
         desc.Windowed, desc.SwapEffect);
@@ -343,9 +495,10 @@ HRESULT STDMETHODCALLTYPE Hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
   if (GetConfig().dump_frame_at > 0 && presents == static_cast<uint64_t>(GetConfig().dump_frame_at))
     frame_dump::Request();
   if (GameHasFocus() && KeyPressedOnce(GetConfig().dlss_toggle_key)) dlaa::Toggle();
+  if (GameHasFocus() && KeyPressedOnce(GetConfig().dlss_mip_bias_key)) mip_bias::Toggle();
   frame_dump::OnPresent();
   camera::OnPresent();
-  dlaa::OnPresent();
+  dlaa::OnPresent(self);
   return o_Present(self, sync, flags);
 }
 
@@ -427,6 +580,8 @@ void OnDeviceCreated(ID3D11Device* device) {
              &o_CreateComputeShader, "Device::CreateComputeShader");
     HookSlot(device, kSlotDevice_CreateDeferredContext, &Hk_CreateDeferredContext,
              &o_CreateDeferredContext, "Device::CreateDeferredContext");
+    HookSlot(device, kSlotDevice_CreateSamplerState, &Hk_CreateSamplerState,
+             &o_CreateSamplerState, "Device::CreateSamplerState");
 
     ID3D11DeviceContext* ctx = nullptr;
     device->GetImmediateContext(&ctx);

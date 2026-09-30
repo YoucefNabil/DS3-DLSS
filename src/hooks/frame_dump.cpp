@@ -251,8 +251,8 @@ void WriteFile() {
   SYSTEMTIME t;
   GetLocalTime(&t);
   wchar_t name[64];
-  swprintf_s(name, L"DS3_DLSS_frame_%04u%02u%02u_%02u%02u%02u.txt", t.wYear, t.wMonth, t.wDay,
-             t.wHour, t.wMinute, t.wSecond);
+  swprintf_s(name, L"DS3_DLSS_frame_%04u%02u%02u_%02u%02u%02u_%03u.txt", t.wYear, t.wMonth,
+             t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
   const std::wstring path = ModuleDir() + name;
   FILE* f = nullptr;
   if (_wfopen_s(&f, path.c_str(), L"w") != 0 || !f) {

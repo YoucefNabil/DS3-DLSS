@@ -1,6 +1,7 @@
 #include "common/config.h"
 
 #include <windows.h>
+#include <cmath>
 
 #include "common/log.h"
 
@@ -36,13 +37,32 @@ void LoadConfig() {
   GetPrivateProfileStringW(L"DLSS", L"ToggleKey", L"0x24", key, 32, ini.c_str());
   g_config.dlss_toggle_key = static_cast<int>(wcstol(key, nullptr, 0));
   g_config.dlss_debug_view = GetPrivateProfileIntW(L"DLSS", L"DebugView", 0, ini.c_str());
+  g_config.dlss_object_motion =
+      GetPrivateProfileIntW(L"DLSS", L"ObjectMotion", 1, ini.c_str()) != 0;
+  g_config.dlss_hide_motion_blur =
+      GetPrivateProfileIntW(L"DLSS", L"HideMotionBlur", 1, ini.c_str()) != 0;
+  wchar_t reactive[32] = {};
+  GetPrivateProfileStringW(L"DLSS", L"Reactive", L"1.0", reactive, 32, ini.c_str());
+  g_config.dlss_reactive = std::fmax(0.0f, static_cast<float>(_wtof(reactive)));
+  wchar_t sharpness[32] = {};
+  GetPrivateProfileStringW(L"DLSS", L"Sharpness", L"0", sharpness, 32, ini.c_str());
+  g_config.dlss_sharpness =
+      std::fmin(1.0f, std::fmax(0.0f, static_cast<float>(_wtof(sharpness))));
+  wchar_t mip_bias[32] = {};
+  GetPrivateProfileStringW(L"DLSS", L"MipBias", L"-0.5", mip_bias, 32, ini.c_str());
+  g_config.dlss_mip_bias =
+      std::fmin(0.0f, std::fmax(-3.0f, static_cast<float>(_wtof(mip_bias))));
+  GetPrivateProfileStringW(L"DLSS", L"MipBiasKey", L"0x23", key, 32, ini.c_str());
+  g_config.dlss_mip_bias_key = static_cast<int>(wcstol(key, nullptr, 0));
   Log("config: Enabled=%d DumpFrameKey=0x%02X DumpFrameAt=%d DumpShaders=%d Jitter=%d "
       "JitterDebugScale=%.2f",
       g_config.enabled, g_config.dump_frame_key, g_config.dump_frame_at, g_config.dump_shaders,
       g_config.jitter, g_config.jitter_debug_scale);
-  Log("config: DLSS=%d Preset=%d JitterSign=%+.0f ToggleKey=0x%02X DebugView=%d", g_config.dlss,
-      g_config.dlss_preset, g_config.dlss_jitter_sign, g_config.dlss_toggle_key,
-      g_config.dlss_debug_view);
+  Log("config: DLSS=%d Preset=%d JitterSign=%+.0f ToggleKey=0x%02X DebugView=%d ObjectMotion=%d"
+      " HideMotionBlur=%d Reactive=%.2f Sharpness=%.2f MipBias=%.2f MipBiasKey=0x%02X",
+      g_config.dlss, g_config.dlss_preset, g_config.dlss_jitter_sign, g_config.dlss_toggle_key,
+      g_config.dlss_debug_view, g_config.dlss_object_motion, g_config.dlss_hide_motion_blur,
+      g_config.dlss_reactive, g_config.dlss_sharpness, g_config.dlss_mip_bias, g_config.dlss_mip_bias_key);
 }
 
 }  // namespace ds3

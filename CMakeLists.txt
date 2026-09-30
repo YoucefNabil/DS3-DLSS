@@ -21,14 +21,21 @@ file(GLOB FXC_DIRS LIST_DIRECTORIES true "$ENV{ProgramFiles\(x86\)}/Windows Kits
 list(SORT FXC_DIRS COMPARE NATURAL ORDER DESCENDING)
 find_program(FXC_EXECUTABLE fxc HINTS ${FXC_DIRS} REQUIRED)
 set(SHADER_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
-add_custom_command(
-  OUTPUT ${SHADER_OUT_DIR}/mv_from_depth.h
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT_DIR}
-  COMMAND ${FXC_EXECUTABLE} /nologo /T cs_5_0 /E main /O3 /Vn kMvFromDepthCs
-          /Fh ${SHADER_OUT_DIR}/mv_from_depth.h ${CMAKE_SOURCE_DIR}/src/dlss/mv_from_depth.hlsl
-  DEPENDS ${CMAKE_SOURCE_DIR}/src/dlss/mv_from_depth.hlsl
-  COMMENT "fxc mv_from_depth.hlsl"
-  VERBATIM)
+function(compile_shader source profile variable header)
+  add_custom_command(
+    OUTPUT ${SHADER_OUT_DIR}/${header}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT_DIR}
+    COMMAND ${FXC_EXECUTABLE} /nologo /T ${profile} /E main /O3 /Vn ${variable}
+            /Fh ${SHADER_OUT_DIR}/${header} ${CMAKE_SOURCE_DIR}/${source}
+    DEPENDS ${CMAKE_SOURCE_DIR}/${source}
+    COMMENT "fxc ${source}"
+    VERBATIM)
+endfunction()
+compile_shader(src/dlss/mv_from_depth.hlsl cs_5_0 kMvFromDepthCs mv_from_depth.h)
+compile_shader(src/dlss/object_motion.hlsl ps_5_0 kObjectMotionPs object_motion_ps.h)
+compile_shader(src/dlss/rcas.hlsl cs_5_0 kRcasCs rcas.h)
+compile_shader(src/dlss/debug_blit_vs.hlsl vs_5_0 kDebugBlitVs debug_blit_vs.h)
+compile_shader(src/dlss/debug_blit_ps.hlsl ps_5_0 kDebugBlitPs debug_blit_ps.h)
 
 add_library(ds3_dlss SHARED
   src/proxy/dllmain.cpp
@@ -42,7 +49,14 @@ add_library(ds3_dlss SHARED
   src/hooks/shader_registry.cpp
   src/camera/scene_camera.cpp
   src/dlss/dlaa.cpp
+  src/dlss/mip_bias.cpp
+  src/dlss/object_motion.cpp
+  src/dlss/reactive.cpp
   ${SHADER_OUT_DIR}/mv_from_depth.h
+  ${SHADER_OUT_DIR}/object_motion_ps.h
+  ${SHADER_OUT_DIR}/rcas.h
+  ${SHADER_OUT_DIR}/debug_blit_vs.h
+  ${SHADER_OUT_DIR}/debug_blit_ps.h
 )
 
 set_target_properties(ds3_dlss PROPERTIES OUTPUT_NAME "d3d11")
@@ -63,3 +77,7 @@ target_link_libraries(smoke_test PRIVATE dxgi d3dcompiler)
 # DLAA path test with a synthetic DS3-like frame (needs the game's dumped PS 393A947C35535471).
 add_executable(dlaa_test tests/dlaa_test.cpp)
 target_link_libraries(dlaa_test PRIVATE dxgi d3dcompiler)
+
+# Constant-buffer listing of the dumped game shaders (camera-matrix audit).
+add_executable(cb_scan tools/cb_scan.cpp)
+target_link_libraries(cb_scan PRIVATE d3dcompiler dxguid)

@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d11.h>
+#include <dxgi.h>
 
 // DLAA on DS3's HDR scene: NVIDIA NGX (DLSS) evaluated at native resolution
 // right before the game's first post-process pass, with motion vectors
@@ -15,6 +16,8 @@ void OnClearDepth(ID3D11DepthStencilView* dsv);
 void BeforeDraw(ID3D11DeviceContext* ctx);
 
 void Toggle();     // hotkey: DLAA + jitter on/off
-void OnPresent();  // updates whether the camera should be jittered
+// Before IDXGISwapChain::Present: updates whether the camera should be
+// jittered, and draws the DebugView overlay onto the back buffer.
+void OnPresent(IDXGISwapChain* swap_chain);
 
 }  // namespace ds3::dlaa

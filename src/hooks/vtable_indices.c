@@ -16,8 +16,18 @@ const size_t kSlotDevice_CreateVertexShader = SLOT(ID3D11DeviceVtbl, CreateVerte
 const size_t kSlotDevice_CreatePixelShader = SLOT(ID3D11DeviceVtbl, CreatePixelShader);
 const size_t kSlotDevice_CreateComputeShader = SLOT(ID3D11DeviceVtbl, CreateComputeShader);
 const size_t kSlotDevice_CreateDeferredContext = SLOT(ID3D11DeviceVtbl, CreateDeferredContext);
+const size_t kSlotDevice_CreateSamplerState = SLOT(ID3D11DeviceVtbl, CreateSamplerState);
 
 const size_t kSlotCtx_Draw = SLOT(ID3D11DeviceContextVtbl, Draw);
+const size_t kSlotCtx_VSSetShader = SLOT(ID3D11DeviceContextVtbl, VSSetShader);
+const size_t kSlotCtx_PSSetShader = SLOT(ID3D11DeviceContextVtbl, PSSetShader);
+const size_t kSlotCtx_PSSetSamplers = SLOT(ID3D11DeviceContextVtbl, PSSetSamplers);
+const size_t kSlotCtx_OMSetRenderTargets = SLOT(ID3D11DeviceContextVtbl, OMSetRenderTargets);
+const size_t kSlotCtx_OMSetRenderTargetsAndUnorderedAccessViews =
+    SLOT(ID3D11DeviceContextVtbl, OMSetRenderTargetsAndUnorderedAccessViews);
+const size_t kSlotCtx_OMSetBlendState = SLOT(ID3D11DeviceContextVtbl, OMSetBlendState);
+const size_t kSlotCtx_OMSetDepthStencilState = SLOT(ID3D11DeviceContextVtbl, OMSetDepthStencilState);
+const size_t kSlotCtx_ClearState = SLOT(ID3D11DeviceContextVtbl, ClearState);
 const size_t kSlotCtx_DrawIndexed = SLOT(ID3D11DeviceContextVtbl, DrawIndexed);
 const size_t kSlotCtx_DrawInstanced = SLOT(ID3D11DeviceContextVtbl, DrawInstanced);
 const size_t kSlotCtx_DrawIndexedInstanced = SLOT(ID3D11DeviceContextVtbl, DrawIndexedInstanced);

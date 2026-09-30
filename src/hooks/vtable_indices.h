@@ -9,8 +9,17 @@ extern const size_t kSlotDevice_CreateVertexShader;
 extern const size_t kSlotDevice_CreatePixelShader;
 extern const size_t kSlotDevice_CreateComputeShader;
 extern const size_t kSlotDevice_CreateDeferredContext;
+extern const size_t kSlotDevice_CreateSamplerState;
 
 extern const size_t kSlotCtx_Draw;
+extern const size_t kSlotCtx_VSSetShader;
+extern const size_t kSlotCtx_PSSetShader;
+extern const size_t kSlotCtx_PSSetSamplers;
+extern const size_t kSlotCtx_OMSetRenderTargets;
+extern const size_t kSlotCtx_OMSetRenderTargetsAndUnorderedAccessViews;
+extern const size_t kSlotCtx_OMSetBlendState;
+extern const size_t kSlotCtx_OMSetDepthStencilState;
+extern const size_t kSlotCtx_ClearState;
 extern const size_t kSlotCtx_DrawIndexed;
 extern const size_t kSlotCtx_DrawInstanced;
 extern const size_t kSlotCtx_DrawIndexedInstanced;

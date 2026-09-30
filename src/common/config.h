@@ -13,6 +13,12 @@ struct Config {
   int dlss_preset = 0;               // [DLSS] Preset: 0 = NGX default, else preset letter (J = 10)
   float dlss_jitter_sign = 1.0f;     // [DLSS] JitterSign: +1 or -1, how the offset is reported
   int dlss_toggle_key = 0x24;        // [DLSS] ToggleKey: VK_HOME switches DLAA + jitter on/off
+  bool dlss_object_motion = true;  // per-object motion vectors from the velocity pass
+  bool dlss_hide_motion_blur = true;  // skip the game's blur draws while object motion runs
+  float dlss_reactive = 1.0f;  // reactive mask strength for transparent effects (0 = off)
+  float dlss_sharpness = 0.0f;  // [DLSS] Sharpness: RCAS after DLAA, 0 = off .. 1 = full
+  float dlss_mip_bias = -0.5f;  // [DLSS] MipBias: texture LOD bias while DLAA runs (0 = off)
+  int dlss_mip_bias_key = 0x23;  // [DLSS] MipBiasKey: VK_END switches the mip bias on/off
   int dlss_debug_view = 0;           // [DLSS] DebugView: 1 = show motion vectors instead
 };
 

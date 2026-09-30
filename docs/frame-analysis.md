@@ -118,3 +118,148 @@ The jitter would be added by adjusting `VC_MatrixViewProj` / `FC_MatrixProj` and
   | DLAA, `JitterSign=-1` | 0.495 |
 
   So +1 (content offset in pixels, y down) is the correct sign.
+
+## Object motion (`src/dlss/object_motion.*`)
+DS3's motion blur draws moving objects into a velocity buffer. These are deferred lists L55/L56, into a 960x540 RGBA8 target with DS T60.
+- **Vertex shaders:** `C48361A10D38D8D5`, `96632548D75B4C2F`, `F54DC44863BE505A`, `3E098128A8A5C75A`.
+  - Inputs: `cbMatrixWVP` (b0: `VC_MatrixWVP`, `VC_PrevMatrixWVP`, unjittered) and `cbPrevObjMatrix` (b6), plus skinning with current and previous bones.
+  - Outputs: TEXCOORD0 = current clip position, TEXCOORD1 = previous clip position.
+- **Pixel shaders:** `940604D2B2BCB300` and its alpha-tested variants `CFEAC2188D902F4E`, `74CCBD38E2950ECA`, `F3EAC67A647852DD`.
+  - Output: `xy = sat((cur_ndc - prev_ndc) * cb7[0].xy * 0.5 + 0.5)`, `z = w / (w + 10)`.
+- **Dilation:** PS `33B0AAA91300023E` dilates the result.
+
+The proxy recognises these VS (by hash, or by the strings `VC_PrevMatrixWVP` + `cbPrevObjMatrix`).
+- After each draw made with one of them, it repeats the draw once with its own PS (`object_motion.hlsl`).
+  - The target is a full-res RGBA16F texture.
+  - The PS does a manual depth test against the scene depth (3% view distance), and outputs `cur_ndc - prev_ndc`.
+  - The velocity VS are unjittered, so the repeat's viewport is offset by the frame's jitter
+    (`TopLeftX/Y = jitter in pixels`). The rasterised silhouette then matches the jittered scene exactly.
+    The motion values come from the VS matrices and are not affected.
+- **State:** only RTVs/DSV, PS, PS SRV t20, PS CB b13, blend, viewports and scissors are swapped, and they are restored right after.
+- **Merge:** `mv_from_depth.hlsl` uses object motion where the pixel is covered, and camera reprojection everywhere else.
+  - Before the viewport jitter, silhouettes could be off by up to a pixel. The CS then also accepted a covered
+    3x3 neighbour at the same depth. That workaround guessed at the edges, and it was removed.
+- **Motion Blur must be on** in the game settings: with it off, the velocity lists are not recorded at all.
+  - With `HideMotionBlur=1` the blur's own draws are skipped: two DrawIndexed calls with PS `E484BFEBC00C5CF7` (scene → temp → scene).
+  - The tile pass (PS `D55E5F7C1E2C4722`) still runs; its result is unused.
+- The game creates each velocity VS many times (64+ objects), so the shader pointers are kept in a large lock-free set.
+- **Test** (`dlaa_test object`): 0.9725 vs 0.9743 analytic on the moving quad; 0 when still; background unaffected.
+  - Every pixel near the quad's edges must be flagged exactly where the jittered scene covers it (frames 6–11).
+  - Without the viewport offset this fails, e.g. on frame 6 with jitter +0.375.
+
+## Reactive mask (transparent effects)
+Effects (bonfire-warp glow, spells, fire, particles) have no depth or motion vectors, so DLSS
+reprojects its history under them and flickers or smears whatever they cover.
+- **Detection:** a draw is an effect when RT0 is the HDR scene (the texture DLAA runs on), RT1 is also
+  bound (DS3's forward/transparent passes use two targets; deferred lighting writes the scene alone),
+  RT0 blending is on, and the depth-stencil state writes neither depth nor stencil.
+- **Redraw:** each such draw is repeated once into a black full-res RGBA16F target, with the game's own
+  shaders, blend state and DSV. Only the RTVs are swapped (`OMSetRenderTargetsAndUnorderedAccessViews`
+  with `D3D11_KEEP_UNORDERED_ACCESS_VIEWS`) and restored right after. The result is what the effects
+  added to each pixel.
+- **Mask:** `mv_from_depth.hlsl` computes `saturate(max(fx.rgb) / max(scene.rgb) * Reactive)` into an
+  R8 texture, passed to DLSS as `pInBiasCurrentColorMask`. The effect target is cleared after each evaluate.
+  History resets set the strength to 0 for that frame.
+- **Test** (`dlaa_test effect`, DebugView=2): 0.498 on an additive 0.5-over-0.5 quad (expected 0.5),
+  0 on an opaque quad drawn into the same targets, 0 elsewhere.
+
+### Dither fades (bonfire warp flicker)
+While the player warps, DS3 stops drawing them in the G-buffer pass (6 targets) and draws them in the
+forward pass (scene + T24) instead, faded with a screen-space dither:
+- Depth pre-pass: VS `FCC46DD7901DED1C` + PS `355B4107029B692E` (discards by `g_DitherTexture` t38,
+  sampled at pixel/4, against `ditherFadeAlpha` in cbInstanceData), and VS `11503580C516F154` with no PS.
+- Shading: VS `3E829D3129D80CBF` + PS `6E984A7E0989E6E7` / `9149E095B4B17A5F` (the latter dithers too).
+- The velocity pass still draws the whole silhouette (VS `C48361A10D38D8D5`).
+
+A first attempt masked these fading draws in the reactive mask (`ReactiveFade`). The character went fully
+white in DebugView=2 but still flickered, so it was removed. The dither itself is not the problem.
+The cause is that the two passes use different camera matrices:
+- The pre-pass VSs (`11503580…`, `FCC46DD7…` and 559 other forward VSs) transform with
+  `cbMatrixWVP` (b0, 192 bytes) in its per-view layout: row_major `VC_View_MatrixCamera` (0, row 3 =
+  camera position, subtracted first), `VC_View_MatrixViewProj` (64, camera-relative, same w-row
+  convention as cbSceneParam) and `VC_ViewFrustumPlanes[4]` (128).
+- The shading VS uses `cbSceneParam.VC_MatrixViewProj`, which was the only one jittered. Its depth differed from
+  the pre-pass by a different sub-pixel amount each frame, so its depth test dropped different pixels each frame.
+
+The main camera's `cbMatrixWVP` is therefore jittered too (`camera::JitterViewCb`), via UpdateSubresource or
+Map(WRITE_DISCARD)/Unmap. It is recognised by content: a rigid camera matrix (column 3 = 0,0,0,1)
+and a perspective ViewProj with a unit forward w-row, w translation 0, and the screen aspect.
+The velocity pass's buffer of the same size (object WVP / PrevWVP / NowToPrevView) fails these
+tests and stays unjittered, as the motion vectors need. The log line "jitter: N cbMatrixWVP uploads jittered last
+frame" shows it working. Confirmed in game: the warp fade-out is smooth.
+
+## Mip bias (`src/dlss/mip_bias.*`)
+DLSS rebuilds detail from many jittered frames, so textures can come from a sharper mip than the game
+picks. NVIDIA recommends a LOD bias of `log2(render / output) - 1`, which is -1 for DLAA.
+- **Twins:** the `CreateSamplerState` hook creates a second sampler with `MipLODBias += MipBias` next to
+  each one that uses mips. Skipped: comparison and min/max filters (shadow maps), `MIN_MAG_MIP_POINT`,
+  and `MaxLOD <= 0` or `MaxLOD <= MinLOD`. The game only ever sees its own sampler. The twin is kept in a
+  map keyed by the original. A private-data `IUnknown` on the original removes that map entry when the
+  runtime destroys the sampler, so a reused address never picks up a stale twin.
+- **Swap:** `PSSetSamplers` binds the twin instead of the original from Present until DLAA runs (the first
+  post pass). Post-processing and UI draws get the originals. The End key (`MipBiasKey`) and the DLAA
+  toggle switch it off without recreating anything.
+- **Test:** every `dlaa_test` mode binds an anisotropic, a comparison and a point sampler before and
+  after the DLAA pass and reads them back. It expects the configured bias on the anisotropic one before
+  DLAA only, and 0 everywhere else. With `MipBias=0` the check fails, as it should.
+
+## Sharpening (`src/dlss/rcas.hlsl`)
+NGX's sharpness parameter is ignored since DLSS 2.5.1, so `[DLSS] Sharpness` runs AMD FidelityFX RCAS
+(FSR 1) as a compute pass on the DLAA output. The result goes into a separate RGBA16F texture and is copied
+back into the scene instead of the raw output. RCAS moves each pixel away from its 4 neighbours, limited so
+that it stays inside their min/max. It needs 0..1 input, so the HDR colour goes through a reversible
+Reinhard curve, `c / (1 + max(c))`, and is expanded again afterwards. The strength scales AMD's lobe
+linearly (1 = RCAS at 0 stops). The cost is one full-screen pass plus a copy. Test (`dlaa_test edge`):
+edge-pixel error vs the supersampled reference 0.1917 / 0.1922 / 0.1926 / 0.1933 at 0 / 0.3 / 0.6 / 1
+(sharper than the exact coverage, as expected). The flat grey scene stays 0.50.
+
+## Camera matrix audit (`tools/cb_scan.cpp`, `src/camera/scene_camera.cpp`)
+The jitter first went only into cbSceneParam (b8) and the per-object cbMatrixWVP. The warp flicker showed
+that any shader holding its *own* copy of the camera matrix renders unjittered, so its output does not
+line up with the jittered scene. `cb_scan <DS3_DLSS_shaders>` reflects every dumped shader and lists each
+cbuffer variable (name, offset, size, type, used). 36 cbuffer layouts carry float4x4/4x3 matrices. After
+dropping object/bone/world-only buffers, these hold a main-camera copy:
+
+| Size | Buffer (examples) | Offsets | Seen in frame dumps |
+|---|---|---|---|
+| 64 | cbMatrixWVP (64), cbwvpmatrix, cbMatrixCamera | 0 | cbwvpmatrix: VS 783C19FD depth-only |
+| 80 | cbLightAccVtxParam, cbParam | 0, 16 | no |
+| 112 | cbPerFrame | 0 | no |
+| 224 | fcbVolumeRenderParam | 96, 160 | no |
+| 288 | cbSSAOParam2 | 0 | SSAO runs at 960x540 |
+| 320 | cbLightAccParam `g_InvProjMatrix`, cbPerScene | 0, 64, 208 | tiled lighting CS E282BB9D, light PS F89A64C9/ECF86353 |
+| 336 | cbPerScene (shadow collect) | 0 | PS 6FE9AFB4 & co. rebuild view pos with InvProj |
+| 416 | cbDecalParam | 0, 64 | no |
+| 448 | VSCommonBuffer, gcbSceneParam | 0, 128, 192, 208 | VSCommonBuffer WVP: VS 9A739EDD/F48B81D9 |
+| 576 | cbAOFields | 192, 384 | no |
+| 640 | cbWave | 64, 192, 256, 384 | no |
+| 864 | cbSceneParam (864) | 80, 144, 208, 800 | no |
+| 1104 | ccbSceneParam | 928, 992 | no |
+
+All of them were unjittered, so deferred lighting, specular and shadow edges were computed at the
+un-offset pixel centre: temporally they did not move with the geometry, and DLAA could not anti-alias them
+(and could smear them slightly). Nothing with a camera matrix draws after the DLAA point.
+
+**Tried and reverted (2026-09-30).** A generic fix jittered every matrix in these buffers that was a
+forward or inverse copy of the main camera's ViewProj (this frame's or the previous frame's), in either
+orientation. In game it matched a lot per frame: 64-byte WVPs x185, gcbSceneParam @0/@128, cbAOFields @384,
+cbLightAccParam, SSAO, decals. The aliasing came back in full. The likely cause is that the net was too wide.
+Buffers used for reprojection or velocity (the game's motion-blur velocity VS that ObjectMotion redraws,
+previous-frame matrices matched against the previous reference) got the current jitter too. So the motion
+vectors carried the jitter delta, and DLAA cancelled its own jitter. Any retry has to be per-buffer, one at
+a time (for example lighting InvProj only), checked in game with A/B each time, and must never touch
+matrices read by the velocity pass or previous-frame matrices. `cb_scan` stays as the tool for that.
+
+## Half-resolution camera copy (fixed 2026-09-30)
+Some areas upload a second cbSceneParam for a 960x540 pass, with the same camera, before the full-resolution
+one. It passed the main-camera test (perspective, screen aspect), so on those frames it became the camera
+snapshot. DLAA then saw "scene colour and camera screen size differ" and skipped: the jitter stayed on and
+the image shook, and it was aliased (2 of 60 frames evaluated in the log). The per-view jitter also used
+960x540 as the screen size. Now only a cbSceneParam whose screen size equals the swap chain's is the main
+camera. Smaller copies get the same NDC jitter as the full-resolution scene and are logged once
+("jitter: 960x540 copy of the main camera …"). Test: every `dlaa_test` mode uploads a half-size copy first.
+
+## Lighting camera jitter (tried and removed 2026-09-30)
+A narrow retry of the audit: only cbLightAccParam (320 B) and cbPerScene (336 B) InvProj at offset 0,
+replaced by the jittered InvProj when it exactly matched this frame's unjittered one. In game the bonfires'
+bright lights flickered, so it was removed at the user's request.

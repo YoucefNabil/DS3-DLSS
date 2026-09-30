@@ -23,8 +23,12 @@ It needs the game's pixel shader bytecode (from `[Debug] DumpShaders=1`), plus `
 and a `DS3_DLSS.ini` next to `d3d11.dll`:
 ```
 dlaa_test <d3d11.dll> <393A947C35535471.ps.cso>        # grey scene stays grey, game bindings survive
+                                                      # (every mode also checks the mip-bias sampler swap)
 dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> mv     # with DebugView=1: motion vectors vs analytic values
 dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> edge   # slanted edge vs 16x16 supersampled reference
+dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> object # with DebugView=1: a moving quad gets object motion vectors;
+                                                      # per-view cbMatrixWVP jittered like cbSceneParam
+dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> effect # with DebugView=2: reactive mask on an additive quad only
 ```
 Set `DS3_DLAA_TEST_DEBUG=1` to run with the D3D11 debug layer.
 
@@ -39,9 +43,28 @@ NGX writes its own logs there too; its lines are also mirrored into `DS3_DLSS.lo
 ## Using DLAA
 - In-game: set **Anti-aliasing Off**. DLAA replaces it (the game's AA is a post-tonemap blur).
 - **Home** toggles DLAA on/off for comparison (`[DLSS] ToggleKey`).
-- `[DLSS] DebugView=1` shows motion vectors (red/green = horizontal/vertical speed, blue = sky).
+- `[DLSS] DebugView=1` draws the motion vectors over the final frame (red/green = horizontal/vertical
+  speed, 1.0 = 4 px per frame;
+  full blue = object motion from the game's velocity pass, dim blue = sky). The scene is not anti-aliased meanwhile.
 - `DS3_DLSS.log` should show `DLSS feature created`, the scene depth line and the matrix self-check.
-- The motion vectors only cover camera motion, so moving characters and effects may ghost slightly.
+- `[DLSS] ObjectMotion=1` (default) adds per-object motion for characters and enemies, reusing the
+  vertex shaders of the game's motion-blur velocity pass. Particles and effects still only get camera motion.
+  **Turn the in-game Motion Blur option on**, otherwise the game skips that pass. `[DLSS] HideMotionBlur=1`
+  (default) skips the blur draws (PS `E484BFEBC00C5CF7`) so the image is not blurred.
+- `[DLSS] Reactive=1` (default) builds a reactive mask from the game's transparent effect draws
+  (glows, spells, fire, particles): where they make up most of a pixel, DLSS favours the current frame
+  over its history, so effects leave no trails. `0` turns it off. `[DLSS] DebugView=2` shows the mask
+  (white = effect).
+- `[DLSS] Sharpness=0` (default off, range 0-1) runs AMD's RCAS sharpening on the DLAA output, before
+  tone mapping. 0.3-0.5 is a good start. DLSS's own sharpening was removed by NVIDIA in DLSS 2.5.1, so
+  it is done here. Turn off driver sharpening (NVIDIA Image Scaling) so the two do not stack.
+- `[DLSS] MipBias=-0.5` (default) samples textures from sharper mips in the 3D scene while DLAA runs
+  (armour, cloth, ground). `-1` is NVIDIA's value for DLAA; lower values can shimmer on fine patterns
+  like chainmail. `0` turns it off. **End** toggles it for comparison (`[DLSS] MipBiasKey`). Shadow,
+  point and single-mip samplers are left alone, and post-processing and the UI keep the game's samplers.
+- The jitter is applied to both copies of the camera the game uploads: cbSceneParam (b8) and
+  the forward pass's cbMatrixWVP (b0). With only the first, objects drawn in the forward pass with a depth
+  pre-pass (the player fading out during a bonfire warp) flickered.
 
 ## Phase 1: mapping the frame
 1. Play **offline**. Stand somewhere with visible shimmer (e.g. Firelink Shrine).
@@ -62,4 +85,5 @@ NGX writes its own logs there too; its lines are also mirrored into `DS3_DLSS.lo
 - `src/camera/`: cbSceneParam tracking and jitter
 - `src/dlss/`: DLAA (NGX D3D11) and `mv_from_depth.hlsl`
 - `tests/dlaa_test.cpp`: DLAA pipeline tests outside the game
+- `tools/cb_scan.cpp`: lists every cbuffer variable of a shader dump (camera matrix audit)
 - `tests/smoke_test.cpp`: drives the proxy outside the game
