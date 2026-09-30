@@ -5,3 +5,6 @@ out/
 DS3_DLSS_frame_*.txt
 DS3_DLSS_shaders/
 releases/
+
+# Screenshots
+*.png

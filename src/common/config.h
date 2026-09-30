@@ -19,6 +19,8 @@ struct Config {
   float dlss_sharpness = 0.0f;  // [DLSS] Sharpness: RCAS after DLAA, 0 = off .. 1 = full
   float dlss_mip_bias = -0.5f;  // [DLSS] MipBias: texture LOD bias while DLAA runs (0 = off)
   int dlss_mip_bias_key = 0x23;  // [DLSS] MipBiasKey: VK_END switches the mip bias on/off
+  // [DLSS] Backend: 0 = Auto (DLSS, or TAA when DLSS is not available), 1 = DLSS, 2 = TAA
+  int dlss_backend = 0;
   int dlss_debug_view = 0;           // [DLSS] DebugView: 1 = show motion vectors instead
 };
 

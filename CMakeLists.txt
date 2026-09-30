@@ -34,6 +34,7 @@ endfunction()
 compile_shader(src/dlss/mv_from_depth.hlsl cs_5_0 kMvFromDepthCs mv_from_depth.h)
 compile_shader(src/dlss/object_motion.hlsl ps_5_0 kObjectMotionPs object_motion_ps.h)
 compile_shader(src/dlss/rcas.hlsl cs_5_0 kRcasCs rcas.h)
+compile_shader(src/dlss/taa.hlsl cs_5_0 kTaaCs taa.h)
 compile_shader(src/dlss/debug_blit_vs.hlsl vs_5_0 kDebugBlitVs debug_blit_vs.h)
 compile_shader(src/dlss/debug_blit_ps.hlsl ps_5_0 kDebugBlitPs debug_blit_ps.h)
 
@@ -55,6 +56,7 @@ add_library(ds3_dlss SHARED
   ${SHADER_OUT_DIR}/mv_from_depth.h
   ${SHADER_OUT_DIR}/object_motion_ps.h
   ${SHADER_OUT_DIR}/rcas.h
+    ${SHADER_OUT_DIR}/taa.h
   ${SHADER_OUT_DIR}/debug_blit_vs.h
   ${SHADER_OUT_DIR}/debug_blit_ps.h
 )

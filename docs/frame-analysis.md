@@ -104,7 +104,76 @@ The jitter would be added by adjusting `VC_MatrixViewProj` / `FC_MatrixProj` and
 - **State:** only the compute stage is saved and restored (shader, SRVs, UAVs, CBs, samplers).
   - `SwapDeviceContextState` + `ClearState` hung the GPU (`DXGI_ERROR_DEVICE_HUNG`) on driver 616.92.
   - It only hung without the debug layer, so it is not used.
-- **Failure:** 30 failed evaluates in a row disable DLAA and the jitter (pass-through).
+- **Failure:** 30 failed evaluates in a row disable DLAA and the jitter (pass-through),
+  or switch to TAA with `Backend=Auto` (see below).
+
+## TAA backend (`src/dlss/taa.hlsl`, `[DLSS] Backend`)
+For GPUs without DLSS. It uses the same inputs as DLSS (jittered HDR scene, motion vectors, depth,
+reactive mask) and runs at the same point, so the jitter, motion vectors and effects are shared.
+- **Choice:** `Auto` tries NGX; if init fails (no RTX GPU, old driver, no `nvngx_dlss.dll`), feature
+  creation fails, or 30 evaluates fail in a row, it switches to TAA for the session with a history reset.
+  `DLSS` turns DLAA off instead, `TAA` never loads NGX.
+- **Shader:** one compute pass, 8x8 threads.
+  - Colours are compressed with luma Reinhard (`c / (1 + luma)`) and filtered in YCoCg.
+  - The current frame is resampled at the unjittered pixel centre from its 3x3 neighbours
+    (Blackman-Harris approximation `exp(-2.29 d²)`), so the image does not wobble with the jitter.
+  - History is fetched at `pixel + mv` of the closest-depth neighbour (edges of moving objects keep
+    their motion) with a 5-tap Catmull-Rom filter.
+  - History is clipped towards the centre of a variance box (mean ± σ, intersected with min/max).
+  - History of another surface is dropped (blend 1): where the depth stored with it, at any of the 2x2
+    texels it is fetched from, differs from this pixel's view distance by more than 5-10%, or where its
+    motion vector differs by more than 1 px + 25% of the speed. This is what removes the smear behind
+    moving characters: on detailed surfaces the 3x3 colour box contains every colour, so the clip alone
+    lets the old surface through.
+  - Blend: 10% current frame (up to 20% at 16 px/frame of motion), raised to the reactive mask value;
+    100% on reset or off-screen history.
+- **Output:** written to our output texture, copied into the history, then into T5 (RCAS runs after
+  the copy into the history, so sharpening does not accumulate).
+- **Tests** (`dlaa_test`, 640x360):
+
+  | Test | TAA | DLSS |
+  |---|---|---|
+  | Edge error after 48 static frames (no AA 0.228) | 0.151 | 0.192 |
+  | Ghost (below): mean error inside the moving quad (no AA 0.065) | 0.036 | 0.066 |
+  | Ghost: mean error just behind it (no AA 0.067) | 0.079 | 0.074 |
+
+  In a folder without `nvngx_dlss.dll`, `Auto` logs `DLSS is not available, using TAA instead` and
+  passes; `DLSS` logs `disabled for this session`. A flat, sharp-edged test scene flatters TAA:
+  on real content it is softer than DLSS and can still flicker on sub-pixel detail.
+
+### Character smear (2026-09-30)
+In game, TAA blurred the moving character like bad motion blur (DLSS a little too).
+- `dlaa_test ghost` reproduces it: a checkerboard quad moving over a checkerboard wall of the same two
+  colours (~5 px cells, compared with an 8x8 supersampled reference).
+  - First TAA: 0.036 inside, **0.124** behind (worse than no AA): the uncovered wall kept the quad's
+    colours, which the colour clip accepts. The depth/motion rejection brings it to 0.079.
+  - With `ObjectMotion=0` (wrong vectors on the quad) the inside error is 0.19 (TAA) / 0.16 (DLSS), and
+    no history test can catch it: last frame's pixel really was the same surface at the same depth.
+    A tighter colour box (0.75σ / 0.5σ) only reaches 0.170 / 0.150 and makes still edges worse
+    (0.1545 / 0.2013 vs 0.1505), so it stays at 1σ.
+- So wrong motion vectors on the character cannot be fixed in the TAA; they must be fixed at the source.
+  `DebugView=3` shows where they are wrong (red): last frame's scene, moved along the vectors (with both
+  frames' jitter removed), outside this frame's 3x3 colour range. `dlaa_test check`: 0.000 red on the quad
+  with object motion, 0.119 without it.
+- In game (`DebugView=3`, 2026-09-30): the world stays dark; the character turns red while the camera
+  moves (worst when orbiting a standing character). Two read-only logs of the velocity draws followed
+  (the code was removed afterwards; it is not in the build):
+  - `cbMatrixWVP` (b0) in the velocity pass holds the **absolute** view-projection (camera translation
+    included) of this frame, and `VC_PrevMatrixWVP` exactly last frame's (max relative difference 0.0000
+    in all 30 logged frames, still and orbiting). `VC_NowToPrevView` is the view-space camera motion.
+    So the pass includes camera motion.
+  - Bone palettes (`cbObjMatrix` b5 / `cbPrevObjMatrix` b6) are 1536-byte (also 2304 / 4128) buffers
+    written with UpdateSubresource, mostly on deferred contexts. Current bones are indexed with the
+    `cbInstanceData[5].x` offset, previous bones without it (the game uploads matching chunks).
+  - For the standing player while orbiting, each bone's game motion equals the camera-only motion to
+    within 0.2 px (the rest is idle animation); static objects to 0.1 px. The velocity data is correct.
+  - The velocity lists are sometimes recorded before the camera upload of the same frame (worker
+    threads), but always within the same Present interval (frame dumps: every list `recorded frame
+    0..0`), so the jitter keyed to the frame counter is right. Using the latest camera's jitter instead
+    would be wrong in exactly that case (tried, reverted).
+  - Conclusion: the red on the character in motion is colour that really changes between frames
+    (view-dependent specular, shadow-map and AO changes while the camera turns), not wrong vectors.
+    The temporal AA correctly drops history there, which is the remaining softness in motion.
 
 ### Test results (`dlaa_test`, RTX 4070 SUPER, driver 616.92)
 - **Motion vectors:** 0.0000 when static (jitter removal is exact); 0.9751 vs 0.9752 analytic when moving.

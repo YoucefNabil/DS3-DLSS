@@ -54,15 +54,20 @@ void LoadConfig() {
       std::fmin(0.0f, std::fmax(-3.0f, static_cast<float>(_wtof(mip_bias))));
   GetPrivateProfileStringW(L"DLSS", L"MipBiasKey", L"0x23", key, 32, ini.c_str());
   g_config.dlss_mip_bias_key = static_cast<int>(wcstol(key, nullptr, 0));
+  wchar_t backend[32] = {};
+  GetPrivateProfileStringW(L"DLSS", L"Backend", L"Auto", backend, 32, ini.c_str());
+  g_config.dlss_backend = _wcsicmp(backend, L"DLSS") == 0 ? 1 : _wcsicmp(backend, L"TAA") == 0 ? 2 : 0;
   Log("config: Enabled=%d DumpFrameKey=0x%02X DumpFrameAt=%d DumpShaders=%d Jitter=%d "
       "JitterDebugScale=%.2f",
       g_config.enabled, g_config.dump_frame_key, g_config.dump_frame_at, g_config.dump_shaders,
       g_config.jitter, g_config.jitter_debug_scale);
   Log("config: DLSS=%d Preset=%d JitterSign=%+.0f ToggleKey=0x%02X DebugView=%d ObjectMotion=%d"
-      " HideMotionBlur=%d Reactive=%.2f Sharpness=%.2f MipBias=%.2f MipBiasKey=0x%02X",
+      " HideMotionBlur=%d Reactive=%.2f Sharpness=%.2f MipBias=%.2f MipBiasKey=0x%02X"
+      " Backend=%s",
       g_config.dlss, g_config.dlss_preset, g_config.dlss_jitter_sign, g_config.dlss_toggle_key,
       g_config.dlss_debug_view, g_config.dlss_object_motion, g_config.dlss_hide_motion_blur,
-      g_config.dlss_reactive, g_config.dlss_sharpness, g_config.dlss_mip_bias, g_config.dlss_mip_bias_key);
+      g_config.dlss_reactive, g_config.dlss_sharpness, g_config.dlss_mip_bias, g_config.dlss_mip_bias_key,
+      g_config.dlss_backend == 1 ? "DLSS" : g_config.dlss_backend == 2 ? "TAA" : "Auto");
 }
 
 }  // namespace ds3

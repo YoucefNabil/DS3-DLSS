@@ -6,7 +6,8 @@ Native DLSS/DLAA for Dark Souls III (DX11), delivered as a `d3d11.dll` proxy.
 `d3d11.dll` exports and hooks device/context/swap-chain calls. It jitters the main
 camera through the game's own `cbSceneParam` upload (no game memory writes), builds
 camera motion vectors from depth, and runs DLSS at native resolution (DLAA) on the HDR
-scene right before the first post-process pass. Upscaling modes are not done yet.
+scene right before the first post-process pass. GPUs without DLSS get the mod's own
+TAA on the same inputs (`[DLSS] Backend=Auto`). Upscaling modes are not done yet.
 
 ## Build
 ```
@@ -29,7 +30,11 @@ dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> edge   # slanted edge vs 16x16 s
 dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> object # with DebugView=1: a moving quad gets object motion vectors;
                                                       # per-view cbMatrixWVP jittered like cbSceneParam
 dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> effect # with DebugView=2: reactive mask on an additive quad only
+dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> ghost  # with DebugView=0: textured quad moving over a textured
+                                                      # background: no smear inside it, no trail behind it
+dlaa_test <d3d11.dll> <393A947C35535471.ps.cso> check  # with DebugView=3: the same scene shows no vector errors
 ```
+Every mode works with `Backend=TAA` too (no `nvngx_dlss.dll` needed then).
 Set `DS3_DLAA_TEST_DEBUG=1` to run with the D3D11 debug layer.
 
 ## Install (testing)
@@ -42,6 +47,10 @@ NGX writes its own logs there too; its lines are also mirrored into `DS3_DLSS.lo
 
 ## Using DLAA
 - In-game: set **Anti-aliasing Off**. DLAA replaces it (the game's AA is a post-tonemap blur).
+- `[DLSS] Backend=Auto` (default) uses DLSS when the GPU and driver support it and falls back to the
+  mod's own TAA otherwise (AMD, Intel, GTX, missing `nvngx_dlss.dll`, or DLSS failing at run time).
+  `TAA` forces TAA, `DLSS` never falls back. The log says `DLAA: ... using TAA instead` on a fallback.
+  Everything else (jitter, motion vectors, reactive mask, sharpening, mip bias, Home toggle) is shared.
 - **Home** toggles DLAA on/off for comparison (`[DLSS] ToggleKey`).
 - `[DLSS] DebugView=1` draws the motion vectors over the final frame (red/green = horizontal/vertical
   speed, 1.0 = 4 px per frame;
@@ -55,6 +64,10 @@ NGX writes its own logs there too; its lines are also mirrored into `DS3_DLSS.lo
   (glows, spells, fire, particles): where they make up most of a pixel, DLSS favours the current frame
   over its history, so effects leave no trails. `0` turns it off. `[DLSS] DebugView=2` shows the mask
   (white = effect).
+- `[DLSS] DebugView=3` checks the motion vectors: last frame is moved along them and compared with this
+  frame. Correct vectors stay dark; **red** marks pixels whose vector is wrong (these blur and smear in
+  motion, with TAA more than with DLSS). A thin red edge behind moving things is normal (just uncovered).
+  Anti-aliasing is off meanwhile.
 - `[DLSS] Sharpness=0` (default off, range 0-1) runs AMD's RCAS sharpening on the DLAA output, before
   tone mapping. 0.3-0.5 is a good start. DLSS's own sharpening was removed by NVIDIA in DLSS 2.5.1, so
   it is done here. Turn off driver sharpening (NVIDIA Image Scaling) so the two do not stack.

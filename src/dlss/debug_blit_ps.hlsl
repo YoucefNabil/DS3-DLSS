@@ -1,4 +1,4 @@
-// Draws the motion-vector visualization over the finished frame (after tone
+// Draws the DebugView image over the finished frame (after tone
 // mapping, auto exposure and UI), so its colours mean what they say.
 // Compiled with fxc (ps_5_0) into debug_blit_ps.h at build time.
 

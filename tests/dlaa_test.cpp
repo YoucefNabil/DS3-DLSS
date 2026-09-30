@@ -2,7 +2,7 @@
 //   cbSceneParam upload (960 bytes) -> ClearDepthStencilView on a D32S8 depth
 //   -> Draw with the game's first post-process pixel shader (393A947C35535471)
 //   reading an RGBA16F scene -> Present.
-// usage: dlaa_test <proxy d3d11.dll> <393A947C35535471.ps.cso> [mv|edge|object|effect]
+// usage: dlaa_test <proxy d3d11.dll> <393A947C35535471.ps.cso> [mv|edge|object|ghost|check|effect]
 // With "mv" ([DLSS] DebugView=1 in the ini) the back buffer shows
 // |motion vector| * 0.25, and the test checks it against the analytic value.
 // With "edge" a slanted white edge is rendered through the (jittered) camera
@@ -11,6 +11,14 @@
 // With "object" ([DLSS] DebugView=1) the camera stays still while a quad moves
 // right; it is also drawn by a velocity vertex shader like the game's motion
 // blur pass, and the test checks the object motion vectors DLSS receives.
+// With "ghost" ([DLSS] DebugView=0) the moving quad and a far background are
+// checkerboards of the same two colours, like a detailed character in front of
+// a detailed scene (the neighbourhood colour box cannot tell them apart). The
+// final image is compared with the analytic pattern: blur/smear inside the quad
+// and trails behind it (any [DLSS] Backend). Without AA the errors are 0.065
+// inside and 0.067 behind (aliasing); the limits catch smearing.
+// With "check" ([DLSS] DebugView=3) the same scene must show no motion vector
+// errors (red) on the quad or the background.
 // With "effect" ([DLSS] DebugView=2) an additive quad (a transparent effect) and
 // an opaque quad are drawn into the scene plus a second target, like DS3's
 // forward pass; the reactive mask must cover only the additive one.
@@ -30,6 +38,8 @@ namespace {
 
 constexpr UINT kW = 640, kH = 360;
 constexpr float kDepth = 0.99f;  // cleared scene depth
+// "ghost": mean colour error allowed on and behind the quad.
+constexpr double kGhostInsideLimit = 0.08, kGhostBehindLimit = 0.09;
 constexpr float kNear = 0.08f, kProj10 = 1.00001f;
 constexpr float kStep = 0.1f;  // camera x movement per frame in the moving phase
 
@@ -119,7 +129,10 @@ int wmain(int argc, wchar_t** argv) {
   }
   const bool check_mv = argc > 3 && wcscmp(argv[3], L"mv") == 0;
   const bool edge = argc > 3 && wcscmp(argv[3], L"edge") == 0;
-  const bool object = argc > 3 && wcscmp(argv[3], L"object") == 0;
+  const bool ghost = argc > 3 && wcscmp(argv[3], L"ghost") == 0;
+  const bool check = argc > 3 && wcscmp(argv[3], L"check") == 0;
+  const bool textured = ghost || check;  // checkerboard quad and background
+  const bool object = textured || (argc > 3 && wcscmp(argv[3], L"object") == 0);
   const bool effect = argc > 3 && wcscmp(argv[3], L"effect") == 0;
   std::ifstream file(argv[2], std::ios::binary);
   const std::vector<char> ps_code((std::istreambuf_iterator<char>(file)),
@@ -339,9 +352,18 @@ int wmain(int argc, wchar_t** argv) {
       "static const float2 kQuad[6] = { float2(-0.5, -0.5), float2(-0.5, 0.5), float2(0.5, 0.5),"
       "  float2(-0.5, -0.5), float2(0.5, 0.5), float2(0.5, -0.5) };"
       "float3 Corner(uint id, float offset) { return float3(kQuad[id].x + offset, kQuad[id].y, 4.0); }"
-      "float4 scene_vs(uint id : SV_VertexID) : SV_Position {"
-      "  return mul(vp, float4(Corner(id, VC_Offsets.x), 1)); }"
+      "void scene_vs(uint id : SV_VertexID, out float4 pos : SV_Position,"
+      "  out float2 local : TEXCOORD0) {"
+      "  local = kQuad[id]; pos = mul(vp, float4(Corner(id, VC_Offsets.x), 1)); }"
       "float4 scene_ps() : SV_Target { return float4(1, 0.2, 0.2, 1); }"
+      "static const float3 kA = float3(0.8, 0.3, 0.2), kB = float3(0.2, 0.35, 0.8);"
+      "float4 scene_tex_ps(float4 pos : SV_Position, float2 local : TEXCOORD0) : SV_Target {"
+      "  float2 c = floor(local / 0.0625); return float4(fmod(c.x + c.y + 64, 2) < 1 ? kA : kB, 1); }"
+      "void bg_vs(uint id : SV_VertexID, out float4 pos : SV_Position,"
+      "  out float2 world : TEXCOORD0) {"
+      "  world = kQuad[id] * 200; pos = mul(vp, float4(world, 20.0, 1)); }"
+      "float4 bg_ps(float4 pos : SV_Position, float2 world : TEXCOORD0) : SV_Target {"
+      "  float2 c = floor(world / 0.3); return float4(fmod(c.x + c.y + 1000, 2) < 1 ? kB : kA, 1); }"
       "void velocity_vs(uint id : SV_VertexID, out float4 pos : SV_Position,"
       "  out float4 cur : TEXCOORD0, out float4 prev : TEXCOORD1) {"
       "  cur = mul(VC_MatrixWVP, float4(Corner(id, VC_Offsets.x), 1));"
@@ -357,8 +379,10 @@ int wmain(int argc, wchar_t** argv) {
     if (errors) std::printf("%s: %s\n", entry, static_cast<const char*>(errors->GetBufferPointer()));
     return blob;
   };
-  ID3DBlob* obj_blobs[4] = {compile("scene_vs", "vs_5_0"), compile("scene_ps", "ps_5_0"),
-                            compile("velocity_vs", "vs_5_0"), compile("velocity_ps", "ps_5_0")};
+  ID3DBlob* obj_blobs[7] = {compile("scene_vs", "vs_5_0"),    compile("scene_ps", "ps_5_0"),
+                            compile("velocity_vs", "vs_5_0"), compile("velocity_ps", "ps_5_0"),
+                            compile("scene_tex_ps", "ps_5_0"), compile("bg_vs", "vs_5_0"),
+                            compile("bg_ps", "ps_5_0")};
   for (ID3DBlob* b : obj_blobs)
     if (!b) return 1;
   ID3D11VertexShader* obj_scene_vs = nullptr;
@@ -369,6 +393,15 @@ int wmain(int argc, wchar_t** argv) {
                              nullptr, &obj_scene_vs);
   device->CreatePixelShader(obj_blobs[1]->GetBufferPointer(), obj_blobs[1]->GetBufferSize(),
                             nullptr, &obj_scene_ps);
+  ID3D11PixelShader* obj_tex_ps = nullptr;  // ghost: checkerboard quad and background
+  ID3D11VertexShader* bg_vs = nullptr;
+  ID3D11PixelShader* bg_ps = nullptr;
+  device->CreatePixelShader(obj_blobs[4]->GetBufferPointer(), obj_blobs[4]->GetBufferSize(),
+                            nullptr, &obj_tex_ps);
+  device->CreateVertexShader(obj_blobs[5]->GetBufferPointer(), obj_blobs[5]->GetBufferSize(),
+                             nullptr, &bg_vs);
+  device->CreatePixelShader(obj_blobs[6]->GetBufferPointer(), obj_blobs[6]->GetBufferSize(),
+                            nullptr, &bg_ps);
   // DS3 creates each velocity shader many times; only the last object is used here.
   std::vector<ID3D11VertexShader*> velocity_copies(100, nullptr);
   for (ID3D11VertexShader*& vs : velocity_copies)
@@ -484,7 +517,7 @@ int wmain(int argc, wchar_t** argv) {
   int silhouette_failures = 0;  // object mode: frames whose silhouette was off
   double cx = 0.0;
   alignas(16) float cb[240];
-  const int frames = edge ? 48 : 12;
+  const int frames = edge ? 48 : textured ? 24 : 12;
   for (int frame = 0; frame < frames; ++frame) {
     if (frame >= 6 && !edge && !object && !effect) cx += kStep;
     FillSceneCb(cb, cx);
@@ -557,10 +590,17 @@ int wmain(int argc, wchar_t** argv) {
       // Scene pass (jittered, writes depth).
       ctx->OMSetRenderTargets(1, &scene_rtv, dsv);
       ctx->RSSetViewports(1, &viewport);
-      ctx->VSSetShader(obj_scene_vs, nullptr, 0);
       ctx->VSSetConstantBuffers(8, 1, &scene_cb);
+      if (textured) {  // background wall, keeps the cleared (far) depth
+        ctx->OMSetDepthStencilState(no_depth_write, 0);
+        ctx->VSSetShader(bg_vs, nullptr, 0);
+        ctx->PSSetShader(bg_ps, nullptr, 0);
+        ctx->Draw(6, 0);
+        ctx->OMSetDepthStencilState(nullptr, 0);
+      }
+      ctx->VSSetShader(obj_scene_vs, nullptr, 0);
       ctx->VSSetConstantBuffers(6, 1, &offsets_cb);
-      ctx->PSSetShader(obj_scene_ps, nullptr, 0);
+      ctx->PSSetShader(textured ? obj_tex_ps : obj_scene_ps, nullptr, 0);
       ctx->Draw(6, 0);
       // Velocity pass, half resolution, like DS3's motion blur.
       const float mid[4] = {0.5f, 0.5f, 0.5f, 0.0f};
@@ -701,7 +741,7 @@ int wmain(int argc, wchar_t** argv) {
                   in.r, opaque.r, out.r, ok ? "ok" : "MISMATCH");
       if (!ok) ++failures;
     }
-    if (object && (frame == 5 || frame == 11)) {
+    if (object && !textured && (frame == 5 || frame == 11)) {
       const Pixel in = read_back(kW / 2, kH / 2);   // on the object
       const Pixel out = read_back(kW / 8, kH / 2);  // background
       const float r = in.r, g = in.g, b = in.b;
@@ -714,7 +754,93 @@ int wmain(int argc, wchar_t** argv) {
                   frame, r, g, b, want, br, bb, ok ? "ok" : "MISMATCH");
       if (!ok) ++failures;
     }
-    if (object && frame >= 6) {
+    if (ghost && frame == frames - 1) {
+      // Compare with the analytic pattern, supersampled 8x8 per pixel (unjittered).
+      // Pixels within 1.5 px of the quad's silhouette are skipped.
+      const double offset = kObjStart + kObjStep * (frame - 5);
+      const double p0 = P0(), p5 = p0 * kW / kH;
+      const double left = (p0 * (-0.5 + offset) / kObjZ + 1) / 2 * kW;
+      const double right = (p0 * (0.5 + offset) / kObjZ + 1) / 2 * kW;
+      const double speed = p0 * kObjStep / kObjZ * kW / 2;  // pixels per frame
+      const double kA[3] = {0.8, 0.3, 0.2}, kB[3] = {0.2, 0.35, 0.8};
+      auto pattern = [&](bool on_quad, double ndc_x, double ndc_y) {
+        const double u = on_quad ? ndc_x * kObjZ / p0 - offset : ndc_x * 20.0 / p0;
+        const double v = on_quad ? ndc_y * kObjZ / p5 : ndc_y * 20.0 / p5;
+        const double cell = on_quad ? 0.0625 : 0.3;
+        const long parity = (static_cast<long>(std::floor(u / cell)) +
+                             static_cast<long>(std::floor(v / cell)) + 1000) % 2;
+        return on_quad == (parity == 0) ? kA : kB;
+      };
+      ctx->CopyResource(staging, scene);  // the anti-aliased scene the game post-processes
+      D3D11_MAPPED_SUBRESOURCE m = {};
+      if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) return 1;
+      double quad_sum = 0, trail_sum = 0, quad_max = 0, trail_max = 0;
+      int quad_n = 0, trail_n = 0;
+      for (UINT y = kH / 2 - 24; y <= kH / 2 + 24; y += 2) {
+        const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const char*>(m.pData) +
+                                                            y * m.RowPitch);
+        for (int x = static_cast<int>(left - 5 * speed); x <= static_cast<int>(right) + 2; ++x) {
+          const double cx = x + 0.5;
+          if (std::fabs(cx - left) < 1.5 || std::fabs(cx - right) < 1.5 || cx > right) continue;
+          const bool on_quad = cx > left;
+          double want[3] = {};
+          for (int sy = 0; sy < 8; ++sy)
+            for (int sx = 0; sx < 8; ++sx) {
+              const double* c = pattern(on_quad, (x + (sx + 0.5) / 8) / kW * 2 - 1,
+                                        1 - (y + (sy + 0.5) / 8) / kH * 2);
+              for (int i = 0; i < 3; ++i) want[i] += c[i] / 64;
+            }
+          double err = 0;
+          for (int c = 0; c < 3; ++c)
+            err = std::fmax(err, std::fabs(HalfToFloat(row[x * 4 + c]) - want[c]));
+          if (on_quad) {
+            quad_sum += err;
+            quad_max = std::fmax(quad_max, err);
+            ++quad_n;
+          } else {
+            trail_sum += err;
+            trail_max = std::fmax(trail_max, err);
+            ++trail_n;
+          }
+        }
+      }
+      ctx->Unmap(staging, 0);
+      const double quad_mean = quad_sum / quad_n, trail_mean = trail_sum / trail_n;
+      const bool ok = quad_mean < kGhostInsideLimit && trail_mean < kGhostBehindLimit;
+      std::printf("ghost: quad moving %.1f px/frame; error inside it mean %.3f max %.3f (%d px, "
+                  "limit %.2f), behind it mean %.3f max %.3f (%d px, limit %.2f) %s\n",
+                  speed, quad_mean, quad_max, quad_n, kGhostInsideLimit, trail_mean, trail_max,
+                  trail_n, kGhostBehindLimit, ok ? "ok" : "MISMATCH");
+      if (!ok) ++failures;
+    }
+    if (check && frame == frames - 1) {
+      // Red = error: r above the dimmed scene's grey (g). Inside the quad
+      // (2 px from its silhouette) and on the background left of it.
+      const double offset = kObjStart + kObjStep * (frame - 5);
+      const double left = (P0() * (-0.5 + offset) / kObjZ + 1) / 2 * kW;
+      const double right = (P0() * (0.5 + offset) / kObjZ + 1) / 2 * kW;
+      double quad = 0, background = 0;
+      int quad_n = 0, background_n = 0;
+      for (UINT y = kH / 2 - 20; y <= kH / 2 + 20; y += 10) {
+        for (UINT x = static_cast<UINT>(left) + 3; x + 3 <= static_cast<UINT>(right); x += 2) {
+          const Pixel px = read_back(x, y);
+          quad += px.r - px.g;
+          ++quad_n;
+        }
+        for (UINT x = kW / 20; x < static_cast<UINT>(left) - 30; x += 8) {
+          const Pixel px = read_back(x, y);
+          background += px.r - px.g;
+          ++background_n;
+        }
+      }
+      quad /= quad_n;
+      background /= background_n;
+      const bool ok = quad < 0.1 && background < 0.1;
+      std::printf("check: motion vector error (red) on the moving quad %.3f, background %.3f "
+                  "(limit 0.1) %s\n", quad, background, ok ? "ok" : "MISMATCH");
+      if (!ok) ++failures;
+    }
+    if (object && !textured && frame >= 6) {
       // Silhouette: the object flag must cover exactly the pixels the jittered
       // scene pass covered (pixel centres inside the quad shifted by the jitter).
       const uint32_t n = static_cast<uint32_t>(frame) % 32 + 1;  // the proxy's jitter index
