@@ -1,0 +1,7 @@
+build/
+out/
+.vs/
+*.log
+DS3_DLSS_frame_*.txt
+DS3_DLSS_shaders/
+releases/
