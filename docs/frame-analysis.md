@@ -104,42 +104,12 @@ The jitter would be added by adjusting `VC_MatrixViewProj` / `FC_MatrixProj` and
 - **State:** only the compute stage is saved and restored (shader, SRVs, UAVs, CBs, samplers).
   - `SwapDeviceContextState` + `ClearState` hung the GPU (`DXGI_ERROR_DEVICE_HUNG`) on driver 616.92.
   - It only hung without the debug layer, so it is not used.
-- **Failure:** 30 failed evaluates in a row disable DLAA and the jitter (pass-through),
-  or switch to TAA with `Backend=Auto` (see below).
+- **Failure:** 30 failed evaluates in a row disable DLAA and the jitter (pass-through).
 
-## TAA backend (`src/dlss/taa.hlsl`, `[DLSS] Backend`)
-For GPUs without DLSS. It uses the same inputs as DLSS (jittered HDR scene, motion vectors, depth,
-reactive mask) and runs at the same point, so the jitter, motion vectors and effects are shared.
-- **Choice:** `Auto` tries NGX; if init fails (no RTX GPU, old driver, no `nvngx_dlss.dll`), feature
-  creation fails, or 30 evaluates fail in a row, it switches to TAA for the session with a history reset.
-  `DLSS` turns DLAA off instead, `TAA` never loads NGX.
-- **Shader:** one compute pass, 8x8 threads.
-  - Colours are compressed with luma Reinhard (`c / (1 + luma)`) and filtered in YCoCg.
-  - The current frame is resampled at the unjittered pixel centre from its 3x3 neighbours
-    (Blackman-Harris approximation `exp(-2.29 d²)`), so the image does not wobble with the jitter.
-  - History is fetched at `pixel + mv` of the closest-depth neighbour (edges of moving objects keep
-    their motion) with a 5-tap Catmull-Rom filter.
-  - History is clipped towards the centre of a variance box (mean ± σ, intersected with min/max).
-  - History of another surface is dropped (blend 1): where the depth stored with it, at any of the 2x2
-    texels it is fetched from, differs from this pixel's view distance by more than 5-10%, or where its
-    motion vector differs by more than 1 px + 25% of the speed. This is what removes the smear behind
-    moving characters: on detailed surfaces the 3x3 colour box contains every colour, so the clip alone
-    lets the old surface through.
-  - Blend: 10% current frame (up to 20% at 16 px/frame of motion), raised to the reactive mask value;
-    100% on reset or off-screen history.
-- **Output:** written to our output texture, copied into the history, then into T5 (RCAS runs after
-  the copy into the history, so sharpening does not accumulate).
-- **Tests** (`dlaa_test`, 640x360):
-
-  | Test | TAA | DLSS |
-  |---|---|---|
-  | Edge error after 48 static frames (no AA 0.228) | 0.151 | 0.192 |
-  | Ghost (below): mean error inside the moving quad (no AA 0.065) | 0.036 | 0.066 |
-  | Ghost: mean error just behind it (no AA 0.067) | 0.079 | 0.074 |
-
-  In a folder without `nvngx_dlss.dll`, `Auto` logs `DLSS is not available, using TAA instead` and
-  passes; `DLSS` logs `disabled for this session`. A flat, sharp-edged test scene flatters TAA:
-  on real content it is softer than DLSS and can still flicker on sub-pixel detail.
+## TAA and FSR backends (removed)
+The mod had its own TAA (for GPUs without DLSS) and AMD FSR 2 / FSR 3 backends on the same inputs.
+They were removed to keep the mod small; the notes below still mention the TAA where it was part of
+the investigation.
 
 ### Character smear (2026-09-30)
 In game, TAA blurred the moving character like bad motion blur (DLSS a little too).
@@ -209,7 +179,8 @@ The proxy recognises these VS (by hash, or by the strings `VC_PrevMatrixWVP` + `
   - Before the viewport jitter, silhouettes could be off by up to a pixel. The CS then also accepted a covered
     3x3 neighbour at the same depth. That workaround guessed at the edges, and it was removed.
 - **Motion Blur must be on** in the game settings: with it off, the velocity lists are not recorded at all.
-  - With `HideMotionBlur=1` the blur's own draws are skipped: two DrawIndexed calls with PS `E484BFEBC00C5CF7` (scene → temp → scene).
+  - The blur itself (two DrawIndexed calls with PS `E484BFEBC00C5CF7`, scene → temp → scene) runs as usual;
+    an option that skipped it (`HideMotionBlur`) was removed.
   - The tile pass (PS `D55E5F7C1E2C4722`) still runs; its result is unused.
 - The game creates each velocity VS many times (64+ objects), so the shader pointers are kept in a large lock-free set.
 - **Test** (`dlaa_test object`): 0.9725 vs 0.9743 analytic on the moving quad; 0 when still; background unaffected.
@@ -271,16 +242,6 @@ picks. NVIDIA recommends a LOD bias of `log2(render / output) - 1`, which is -1 
 - **Test:** every `dlaa_test` mode binds an anisotropic, a comparison and a point sampler before and
   after the DLAA pass and reads them back. It expects the configured bias on the anisotropic one before
   DLAA only, and 0 everywhere else. With `MipBias=0` the check fails, as it should.
-
-## Sharpening (`src/dlss/rcas.hlsl`)
-NGX's sharpness parameter is ignored since DLSS 2.5.1, so `[DLSS] Sharpness` runs AMD FidelityFX RCAS
-(FSR 1) as a compute pass on the DLAA output. The result goes into a separate RGBA16F texture and is copied
-back into the scene instead of the raw output. RCAS moves each pixel away from its 4 neighbours, limited so
-that it stays inside their min/max. It needs 0..1 input, so the HDR colour goes through a reversible
-Reinhard curve, `c / (1 + max(c))`, and is expanded again afterwards. The strength scales AMD's lobe
-linearly (1 = RCAS at 0 stops). The cost is one full-screen pass plus a copy. Test (`dlaa_test edge`):
-edge-pixel error vs the supersampled reference 0.1917 / 0.1922 / 0.1926 / 0.1933 at 0 / 0.3 / 0.6 / 1
-(sharper than the exact coverage, as expected). The flat grey scene stays 0.50.
 
 ## Camera matrix audit (`tools/cb_scan.cpp`, `src/camera/scene_camera.cpp`)
 The jitter first went only into cbSceneParam (b8) and the per-object cbMatrixWVP. The warp flicker showed

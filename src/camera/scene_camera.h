@@ -24,6 +24,8 @@ struct Snapshot {
   float view_proj[16] = {};          // camera-relative world -> clip
   float camera_pos[3] = {};
   float proj_z = 0;  // FC_MatrixProj[10]: depth = proj_z - near / view distance
+  float near_plane = 0;  // view distance of depth 0
+  float fov_y = 0;       // vertical field of view, radians
 };
 
 // Returns the data to upload: `data` unchanged, or `scratch` (kSceneCbBytes)

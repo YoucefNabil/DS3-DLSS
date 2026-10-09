@@ -33,8 +33,6 @@ function(compile_shader source profile variable header)
 endfunction()
 compile_shader(src/dlss/mv_from_depth.hlsl cs_5_0 kMvFromDepthCs mv_from_depth.h)
 compile_shader(src/dlss/object_motion.hlsl ps_5_0 kObjectMotionPs object_motion_ps.h)
-compile_shader(src/dlss/rcas.hlsl cs_5_0 kRcasCs rcas.h)
-compile_shader(src/dlss/taa.hlsl cs_5_0 kTaaCs taa.h)
 compile_shader(src/dlss/debug_blit_vs.hlsl vs_5_0 kDebugBlitVs debug_blit_vs.h)
 compile_shader(src/dlss/debug_blit_ps.hlsl ps_5_0 kDebugBlitPs debug_blit_ps.h)
 
@@ -53,10 +51,13 @@ add_library(ds3_dlss SHARED
   src/dlss/mip_bias.cpp
   src/dlss/object_motion.cpp
   src/dlss/reactive.cpp
+  src/dlss/capture.cpp
+  src/widescreen/widescreen.cpp
+  src/tweaks/game_memory.cpp
+  src/tweaks/frame_rate.cpp
+  src/tweaks/window.cpp
   ${SHADER_OUT_DIR}/mv_from_depth.h
   ${SHADER_OUT_DIR}/object_motion_ps.h
-  ${SHADER_OUT_DIR}/rcas.h
-    ${SHADER_OUT_DIR}/taa.h
   ${SHADER_OUT_DIR}/debug_blit_vs.h
   ${SHADER_OUT_DIR}/debug_blit_ps.h
 )
@@ -75,11 +76,31 @@ target_link_libraries(ds3_dlss PRIVATE minhook dxguid
 add_executable(smoke_test tests/smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE dxgi d3dcompiler)
 
-
 # DLAA path test with a synthetic DS3-like frame (needs the game's dumped PS 393A947C35535471).
 add_executable(dlaa_test tests/dlaa_test.cpp)
 target_link_libraries(dlaa_test PRIVATE dxgi d3dcompiler)
 
+# [Widescreen] table search and GraphicsConfig.xml rewrite.
+add_executable(widescreen_test tests/widescreen_test.cpp src/widescreen/widescreen.cpp
+  src/common/config.cpp src/common/log.cpp)
+target_include_directories(widescreen_test PRIVATE src)
+target_compile_definitions(widescreen_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+
+# [FrameRate] / [Window] code search on the real exe, sprint factors, window maths.
+add_executable(tweaks_test tests/tweaks_test.cpp src/tweaks/game_memory.cpp
+  src/tweaks/frame_rate.cpp src/tweaks/window.cpp src/common/config.cpp src/common/log.cpp)
+target_include_directories(tweaks_test PRIVATE src)
+target_compile_definitions(tweaks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(tweaks_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(tweaks_test PRIVATE minhook)
+
 # Constant-buffer listing of the dumped game shaders (camera-matrix audit).
 add_executable(cb_scan tools/cb_scan.cpp)
 target_link_libraries(cb_scan PRIVATE d3dcompiler dxguid)
+
+# Offline replay of a [Debug] CaptureKey capture through DLSS, with metrics.
+add_executable(capture_replay tools/capture_replay.cpp)
+target_include_directories(capture_replay PRIVATE src)
+target_compile_definitions(capture_replay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(capture_replay PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(capture_replay PRIVATE windowscodecs ole32)

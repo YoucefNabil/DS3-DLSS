@@ -2,33 +2,45 @@
 //   cbSceneParam upload (960 bytes) -> ClearDepthStencilView on a D32S8 depth
 //   -> Draw with the game's first post-process pixel shader (393A947C35535471)
 //   reading an RGBA16F scene -> Present.
-// usage: dlaa_test <proxy d3d11.dll> <393A947C35535471.ps.cso> [mv|edge|object|ghost|check|effect]
-// With "mv" ([DLSS] DebugView=1 in the ini) the back buffer shows
+// usage: dlaa_test <proxy d3d11.dll> <393A947C35535471.ps.cso>
+//                  [mv|edge|object|ghost|check|effect|shimmer|shimmer-pan]
+// DebugView needs [Debug] Enabled=1 in the ini.
+// With "mv" ([Debug] DebugView=1 in the ini) the back buffer shows
 // |motion vector| * 0.25, and the test checks it against the analytic value.
 // With "edge" a slanted white edge is rendered through the (jittered) camera
 // constants for 48 static frames, and the result is compared with a
 // supersampled reference: the error shows whether [DLSS] JitterSign is right.
-// With "object" ([DLSS] DebugView=1) the camera stays still while a quad moves
+// With "object" ([Debug] DebugView=1) the camera stays still while a quad moves
 // right; it is also drawn by a velocity vertex shader like the game's motion
 // blur pass, and the test checks the object motion vectors DLSS receives.
-// With "ghost" ([DLSS] DebugView=0) the moving quad and a far background are
+// With "ghost" ([Debug] DebugView=0) the moving quad and a far background are
 // checkerboards of the same two colours, like a detailed character in front of
 // a detailed scene (the neighbourhood colour box cannot tell them apart). The
 // final image is compared with the analytic pattern: blur/smear inside the quad
-// and trails behind it (any [DLSS] Backend). Without AA the errors are 0.065
+// and trails behind it. Without AA the errors are 0.065
 // inside and 0.067 behind (aliasing); the limits catch smearing.
-// With "check" ([DLSS] DebugView=3) the same scene must show no motion vector
+// With "check" ([Debug] DebugView=3) the same scene must show no motion vector
 // errors (red) on the quad or the background.
-// With "effect" ([DLSS] DebugView=2) an additive quad (a transparent effect) and
+// With "effect" ([Debug] DebugView=2) an additive quad (a transparent effect) and
 // an opaque quad are drawn into the scene plus a second target, like DS3's
 // forward pass; the reactive mask must cover only the additive one.
+// With "shimmer" a static field of thin slanted lines (0.4 px wide, like distant
+// foliage or chainmail) is rendered through the jittered camera for 128 frames.
+// Over the last 32 frames the test reports how much each pixel still changes
+// from frame to frame (shimmer) and its error against a supersampled reference.
+// "shimmer-pan" is the same with the camera drifting right by 0.5 px per frame;
+// the errors are then against the reference shifted with it, and the std dev
+// is that of the error.
+// It measures; it has no limit.
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -134,6 +146,8 @@ int wmain(int argc, wchar_t** argv) {
   const bool textured = ghost || check;  // checkerboard quad and background
   const bool object = textured || (argc > 3 && wcscmp(argv[3], L"object") == 0);
   const bool effect = argc > 3 && wcscmp(argv[3], L"effect") == 0;
+  const bool shimmer_pan = argc > 3 && wcscmp(argv[3], L"shimmer-pan") == 0;
+  const bool shimmer = shimmer_pan || (argc > 3 && wcscmp(argv[3], L"shimmer") == 0);
   std::ifstream file(argv[2], std::ios::binary);
   const std::vector<char> ps_code((std::istreambuf_iterator<char>(file)),
                                   std::istreambuf_iterator<char>());
@@ -145,7 +159,7 @@ int wmain(int argc, wchar_t** argv) {
       reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(proxy, "D3D11CreateDevice"));
   ID3D11Device* device = nullptr;
   ID3D11DeviceContext* ctx = nullptr;
-  const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;
+  const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;  // what DS3 asks for
   // DS3_DLAA_TEST_DEBUG=1: D3D11 debug layer, messages printed after each frame.
   const bool debug_layer = GetEnvironmentVariableA("DS3_DLAA_TEST_DEBUG", nullptr, 0) != 0;
   HRESULT hr = create_device(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -332,6 +346,70 @@ int wmain(int argc, wchar_t** argv) {
                              nullptr, &edge_vs);
   device->CreatePixelShader(edge_ps_blob->GetBufferPointer(), edge_ps_blob->GetBufferSize(),
                             nullptr, &edge_ps);
+  // Shimmer scene: a screen-covering plane at view depth kEdgeZ whose shader
+  // draws two sets of thin lines fixed in the world (point sampled per pixel,
+  // so the input aliases like real thin geometry). Positions are camera
+  // relative like DS3's: the plane moves by the camera x (cbSceneParam pad[3]).
+  // The lines write depth in front of a far background (kShimmerFarDepth), so
+  // under jitter a pixel's depth flips between them, as with real foliage.
+  constexpr double kLinePeriod = 2.7, kLineWidth = 0.4;  // pixels
+  constexpr double kLineDir[2][2] = {{0.9806, 0.1961}, {-0.4472, 0.8944}};
+  auto line_coverage = [&](double px, double py) {
+    for (const auto& d : kLineDir) {
+      const double t = (px * d[0] + py * d[1]) / kLinePeriod;
+      if (t - std::floor(t) < kLineWidth / kLinePeriod) return 1.0;
+    }
+    return 0.0;
+  };
+  // DS3_SHIMMER_SCALE: brightness of the lines (HDR scenes are not 0..1);
+  // the statistics are divided by it.
+  double shimmer_scale = 1.0;
+  {
+    char v[32] = {};
+    if (GetEnvironmentVariableA("DS3_SHIMMER_SCALE", v, sizeof(v))) shimmer_scale = std::atof(v);
+  }
+  char shimmer_src[1536];
+  std::snprintf(shimmer_src, sizeof(shimmer_src),
+                "cbuffer cbSceneParam : register(b8) { float4 pad[24]; row_major float4x4 vp; };"
+                "static const float3 kPos[3] = { float3(%.9g, %.9g, %.9g), float3(%.9g, %.9g, "
+                "%.9g), float3(%.9g, %.9g, %.9g) };"
+                "struct V { float4 pos : SV_Position; float3 view : VIEW; };"
+                "V vs(uint id : SV_VertexID) { V o;"
+                "  o.pos = mul(vp, float4(kPos[id] - float3(pad[3].x, 0, 0), 1));"
+                "  o.view = kPos[id]; return o; }"
+                "float lines(float2 px, float2 d) { float t = dot(px, d) / %.9g;"
+                "  return frac(t) < %.9g ? 1 : 0; }"
+                "float4 ps(V i) : SV_Target {"
+                "  float2 ndc = float2(i.view.x * %.9g, i.view.y * %.9g) / i.view.z;"
+                "  float2 px = float2((ndc.x + 1) * %u / 2.0, (1 - ndc.y) * %u / 2.0);"
+                "  float c = max(lines(px, float2(%.9g, %.9g)), lines(px, float2(%.9g, %.9g)));"
+                "  if (c == 0) discard;"
+                "  return float4(c, c, c, 1) * float4(%.9g, %.9g, %.9g, 1); }",
+                -3.0 * kEdgeZ / P0(), -3.0 * kEdgeZ / (P0() * kW / kH), kEdgeZ,
+                9.0 * kEdgeZ / P0(), -3.0 * kEdgeZ / (P0() * kW / kH), kEdgeZ,
+                -3.0 * kEdgeZ / P0(), 9.0 * kEdgeZ / (P0() * kW / kH), kEdgeZ,
+                kLinePeriod, kLineWidth / kLinePeriod, P0(), P0() * kW / kH, kW, kH,
+                kLineDir[0][0], kLineDir[0][1], kLineDir[1][0], kLineDir[1][1], shimmer_scale,
+                shimmer_scale, shimmer_scale);
+  ID3DBlob* shimmer_vs_blob = nullptr;
+  ID3DBlob* shimmer_ps_blob = nullptr;
+  D3DCompile(shimmer_src, std::strlen(shimmer_src), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0,
+             0, &shimmer_vs_blob, nullptr);
+  D3DCompile(shimmer_src, std::strlen(shimmer_src), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0,
+             0, &shimmer_ps_blob, nullptr);
+  if (!shimmer_vs_blob || !shimmer_ps_blob) return 1;
+  ID3D11VertexShader* shimmer_vs = nullptr;
+  ID3D11PixelShader* shimmer_ps = nullptr;
+  device->CreateVertexShader(shimmer_vs_blob->GetBufferPointer(),
+                             shimmer_vs_blob->GetBufferSize(), nullptr, &shimmer_vs);
+  device->CreatePixelShader(shimmer_ps_blob->GetBufferPointer(),
+                            shimmer_ps_blob->GetBufferSize(), nullptr, &shimmer_ps);
+  constexpr int kShimmerFrames = 128, kShimmerWindow = 32;
+  const float kShimmerFarDepth = static_cast<float>(kProj10 - kNear * kProj10 / 300.0);  // 300 m
+  std::vector<float> shimmer_history;  // kShimmerWindow frames of red, row-major
+  std::vector<double> shimmer_shift;   // per kept frame: pattern shift in pixels
+  // shimmer-pan: camera x step for 0.5 px per frame at the plane's depth.
+  const double pan_step = 0.5 / (P0() / kEdgeZ * kW / 2);
   D3D11_RASTERIZER_DESC rd = {};
   rd.FillMode = D3D11_FILL_SOLID;
   rd.CullMode = D3D11_CULL_NONE;
@@ -517,9 +595,10 @@ int wmain(int argc, wchar_t** argv) {
   int silhouette_failures = 0;  // object mode: frames whose silhouette was off
   double cx = 0.0;
   alignas(16) float cb[240];
-  const int frames = edge ? 48 : textured ? 24 : 12;
+  const int frames = shimmer ? kShimmerFrames : edge ? 48 : textured ? 24 : 12;
   for (int frame = 0; frame < frames; ++frame) {
-    if (frame >= 6 && !edge && !object && !effect) cx += kStep;
+    if (frame >= 6 && !edge && !object && !effect && !shimmer) cx += kStep;
+    if (shimmer_pan && frame >= 1) cx += pan_step;
     FillSceneCb(cb, cx);
     {
       alignas(16) float half[240];
@@ -543,10 +622,11 @@ int wmain(int argc, wchar_t** argv) {
         if (!same || !jittered) ++half_failures;
       }
     }
-    ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, kDepth, 0);
+    ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+                               shimmer ? kShimmerFarDepth : kDepth, 0);
     const float grey[4] = {0.5f, 0.5f, 0.5f, 1.0f};
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    ctx->ClearRenderTargetView(scene_rtv, edge ? black : grey);
+    ctx->ClearRenderTargetView(scene_rtv, edge || shimmer ? black : grey);
     const D3D11_VIEWPORT viewport = {0, 0, kW, kH, 0, 1};
     if (object) {
       const float offsets[4] = {
@@ -636,13 +716,14 @@ int wmain(int argc, wchar_t** argv) {
       ctx->OMSetDepthStencilState(nullptr, 0);
       ctx->RSSetState(nullptr);
     }
-    if (edge) {
-      ctx->OMSetRenderTargets(1, &scene_rtv, nullptr);
+    if (edge || shimmer) {
+      ctx->OMSetRenderTargets(1, &scene_rtv, shimmer ? dsv : nullptr);
+      ctx->OMSetDepthStencilState(nullptr, 0);
       ctx->RSSetViewports(1, &viewport);
       ctx->RSSetState(no_cull);
-      ctx->VSSetShader(edge_vs, nullptr, 0);
+      ctx->VSSetShader(shimmer ? shimmer_vs : edge_vs, nullptr, 0);
       ctx->VSSetConstantBuffers(8, 1, &scene_cb);
-      ctx->PSSetShader(edge_ps, nullptr, 0);
+      ctx->PSSetShader(shimmer ? shimmer_ps : edge_ps, nullptr, 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       ctx->Draw(3, 0);
     }
@@ -693,6 +774,57 @@ int wmain(int argc, wchar_t** argv) {
     ctx->CSSetShaderResources(3, 1, &no_srv);
     swap_chain->Present(0, 0);
 
+    if (shimmer && frame >= frames - kShimmerWindow) {
+      ctx->CopyResource(staging, scene);
+      D3D11_MAPPED_SUBRESOURCE m = {};
+      if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) return 1;
+      for (UINT y = 0; y < kH; ++y) {
+        const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const char*>(m.pData) +
+                                                            y * m.RowPitch);
+        for (UINT x = 0; x < kW; ++x)
+          shimmer_history.push_back(static_cast<float>(HalfToFloat(row[x * 4]) / shimmer_scale));
+      }
+      ctx->Unmap(staging, 0);
+      shimmer_shift.push_back(cx * P0() / kEdgeZ * kW / 2);
+    }
+    if (shimmer && frame == frames - 1) {
+      // Per pixel: standard deviation over the window (shimmer), mean absolute
+      // change between consecutive frames (flicker), and the error of each
+      // frame and of the time average against 8x8 supersampled coverage.
+      const size_t n = static_cast<size_t>(kW) * kH;
+      double sd_sum = 0, step_sum = 0, err_sum = 0, frame_err_sum = 0;
+      // Edge columns are skipped when panning (content enters there). Every
+      // statistic is of the error against that frame's reference, which for a
+      // static scene makes the std dev and change those of the value itself.
+      const UINT x0 = shimmer_pan ? 16 : 0, x1 = shimmer_pan ? kW - 16 : kW;
+      size_t counted = 0;
+      for (UINT y = 0; y < kH; ++y)
+        for (UINT x = x0; x < x1; ++x) {
+          const size_t i = static_cast<size_t>(y) * kW + x;
+          double mean = 0, sq = 0, prev = 0;
+          for (int f = 0; f < kShimmerWindow; ++f) {
+            double ref = 0;
+            for (int sy = 0; sy < 8; ++sy)
+              for (int sx = 0; sx < 8; ++sx)
+                ref += line_coverage(x + shimmer_shift[f] + (sx + 0.5) / 8, y + (sy + 0.5) / 8);
+            const double e = shimmer_history[f * n + i] - ref / 64;
+            mean += e;
+            sq += e * e;
+            frame_err_sum += std::fabs(e);
+            if (f > 0) step_sum += std::fabs(e - prev);
+            prev = e;
+          }
+          mean /= kShimmerWindow;
+          sd_sum += std::sqrt((std::max)(0.0, sq / kShimmerWindow - mean * mean));
+          err_sum += std::fabs(mean);
+          ++counted;
+        }
+      std::printf("shimmer: per-pixel std dev %.4f, frame-to-frame change %.4f, error per frame "
+                  "%.4f, error of the time average %.4f (thin lines, last %d of %d frames)\n",
+                  sd_sum / counted, step_sum / (counted * (kShimmerWindow - 1)),
+                  frame_err_sum / (counted * kShimmerWindow), err_sum / counted, kShimmerWindow,
+                  frames);
+    }
     if (edge && frame == frames - 1) {
       ctx->CopyResource(staging, scene);
       D3D11_MAPPED_SUBRESOURCE m = {};
@@ -776,6 +908,9 @@ int wmain(int argc, wchar_t** argv) {
       if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) return 1;
       double quad_sum = 0, trail_sum = 0, quad_max = 0, trail_max = 0;
       int quad_n = 0, trail_n = 0;
+      // Sharpness inside the quad: how much of the pattern's contrast (red
+      // channel, deviation from its mean) survives. 1 = sharp, lower = blurred.
+      std::vector<double> got_r, want_r;
       for (UINT y = kH / 2 - 24; y <= kH / 2 + 24; y += 2) {
         const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const char*>(m.pData) +
                                                             y * m.RowPitch);
@@ -794,6 +929,8 @@ int wmain(int argc, wchar_t** argv) {
           for (int c = 0; c < 3; ++c)
             err = std::fmax(err, std::fabs(HalfToFloat(row[x * 4 + c]) - want[c]));
           if (on_quad) {
+            got_r.push_back(HalfToFloat(row[x * 4]));
+            want_r.push_back(want[0]);
             quad_sum += err;
             quad_max = std::fmax(quad_max, err);
             ++quad_n;
@@ -807,6 +944,14 @@ int wmain(int argc, wchar_t** argv) {
       ctx->Unmap(staging, 0);
       const double quad_mean = quad_sum / quad_n, trail_mean = trail_sum / trail_n;
       const bool ok = quad_mean < kGhostInsideLimit && trail_mean < kGhostBehindLimit;
+      double got_mean = 0, want_mean = 0, got_dev = 0, want_dev = 0;
+      for (size_t i = 0; i < got_r.size(); ++i) got_mean += got_r[i] / got_r.size();
+      for (size_t i = 0; i < want_r.size(); ++i) want_mean += want_r[i] / want_r.size();
+      for (size_t i = 0; i < got_r.size(); ++i) {
+        got_dev += std::fabs(got_r[i] - got_mean);
+        want_dev += std::fabs(want_r[i] - want_mean);
+      }
+      std::printf("ghost: contrast kept inside the quad %.2f (1 = sharp)\n", got_dev / want_dev);
       std::printf("ghost: quad moving %.1f px/frame; error inside it mean %.3f max %.3f (%d px, "
                   "limit %.2f), behind it mean %.3f max %.3f (%d px, limit %.2f) %s\n",
                   speed, quad_mean, quad_max, quad_n, kGhostInsideLimit, trail_mean, trail_max,
@@ -867,7 +1012,7 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("object silhouette: matches the jittered scene on frames 6-%d ok\n", frame);
       }
     }
-    if (!edge && !object && !effect && (frame == 5 || frame == 11)) {
+    if (!edge && !object && !effect && !shimmer && (frame == 5 || frame == 11)) {
       float r, g;
       if (check_mv) {  // DebugView image on the back buffer
         const Pixel px = read_back(kW / 2, kH / 2);

@@ -41,6 +41,7 @@ extern const size_t kSlotFactory2_CreateSwapChainForHwnd;
 
 extern const size_t kSlotSwapChain_Present;
 extern const size_t kSlotSwapChain_ResizeBuffers;
+extern const size_t kSlotSwapChain_SetFullscreenState;
 
 #ifdef __cplusplus
 }

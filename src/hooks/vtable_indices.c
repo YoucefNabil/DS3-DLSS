@@ -49,3 +49,4 @@ const size_t kSlotFactory2_CreateSwapChainForHwnd = SLOT(IDXGIFactory2Vtbl, Crea
 
 const size_t kSlotSwapChain_Present = SLOT(IDXGISwapChainVtbl, Present);
 const size_t kSlotSwapChain_ResizeBuffers = SLOT(IDXGISwapChainVtbl, ResizeBuffers);
+const size_t kSlotSwapChain_SetFullscreenState = SLOT(IDXGISwapChainVtbl, SetFullscreenState);

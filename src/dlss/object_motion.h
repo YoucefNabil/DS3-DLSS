@@ -16,25 +16,21 @@
 
 namespace ds3::object_motion {
 
-// The velocity pass only runs when the in-game Motion Blur option is on. The
-// blur itself can then be hidden by skipping its draws (HideMotionBlur).
+// The velocity pass only runs when the in-game Motion Blur option is on.
 
-// Device hooks: remember the game's velocity vertex shaders and blur pixel shader.
+// Device hook: remember the game's velocity vertex shaders.
 void OnVertexShaderCreated(ID3D11VertexShader* vs, const void* code, size_t length, uint64_t hash);
-void OnPixelShaderCreated(ID3D11PixelShader* ps, uint64_t hash);
 
 // Context hooks, any thread.
 void OnSetVertexShader(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs);
-void OnSetPixelShader(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps);
 bool WantsRedraw(ID3D11DeviceContext* ctx);  // cheap; true for velocity draws while active
-bool SkipDraw(ID3D11DeviceContext* ctx);     // cheap; true for motion blur draws while hidden
 
 // Rebinds our target and pixel shader, runs `draw` (the original draw call), restores.
 template <typename Draw>
 void Redraw(ID3D11DeviceContext* ctx, Draw draw);
 
 // DLAA side, immediate context only.
-void SetActive(bool active, bool hide_motion_blur);
+void SetActive(bool active);
 // Creates/refreshes the target for w x h and the view of the scene depth.
 bool Prepare(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UINT h,
              ID3D11Texture2D* scene_depth, float proj_z);

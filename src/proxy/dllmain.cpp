@@ -1,7 +1,8 @@
 // d3d11.dll proxy entry point.
 // Loads the real System32\d3d11.dll, resolves the pass-through exports used by
 // export_stubs.asm, and intercepts device creation to install our D3D11 hooks.
-// Nothing in DarkSoulsIII.exe is touched here.
+// Nothing else in DarkSoulsIII.exe is touched, except by the optional
+// [Widescreen], [FrameRate] and [Window] sections (widescreen/, tweaks/).
 #include <windows.h>
 #include <d3d11.h>
 
@@ -11,6 +12,9 @@
 #include "common/config.h"
 #include "common/log.h"
 #include "hooks/d3d11_hooks.h"
+#include "tweaks/frame_rate.h"
+#include "tweaks/window.h"
+#include "widescreen/widescreen.h"
 
 // Same order as the STUB indices in export_stubs.asm.
 static const char* const kForwardedNames[] = {
@@ -131,6 +135,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     ds3::LogInit();
     ds3::Log("DS3_DLSS proxy attached");
     ds3::LoadConfig();
+    ds3::widescreen::Apply();  // before the game's own code reads its resolution list
+    ds3::window::Apply();      // before the game creates its window
+    ds3::frame_rate::Apply();  // waits on its own thread for the game to start up
     if (!LoadRealD3D11()) return FALSE;
   }
   return TRUE;

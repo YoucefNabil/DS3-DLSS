@@ -26,12 +26,7 @@ constexpr UINT kCbSlot = 13;
 constexpr uint64_t kKnownVelocityVs[] = {0xC48361A10D38D8D5ull, 0x96632548D75B4C2Full,
                                          0xF54DC44863BE505Aull, 0x3E098128A8A5C75Aull};
 
-// The motion blur itself: two full-screen draws that blur the post-process
-// scene in place (T760 -> T768 -> T760). Skipped when HideMotionBlur is on.
-constexpr uint64_t kMotionBlurPs = 0xE484BFEBC00C5CF7ull;
-
 PointerSet<16384> g_velocity_vs;
-PointerSet<1024> g_blur_ps;
 std::atomic<uint32_t> g_velocity_vs_count{0};
 
 // What each context currently has bound. A context is only used by one thread
@@ -39,13 +34,11 @@ std::atomic<uint32_t> g_velocity_vs_count{0};
 struct ContextSlot {
   std::atomic<ID3D11DeviceContext*> ctx{nullptr};
   std::atomic<bool> velocity{false};  // a velocity vertex shader
-  std::atomic<bool> blur{false};      // the motion blur pixel shader
 };
 constexpr size_t kMaxContexts = 64;
 ContextSlot g_contexts[kMaxContexts];
 
 std::atomic<bool> g_active{false};
-std::atomic<bool> g_hide_blur{false};
 std::atomic<bool> g_ready{false};
 std::atomic<uint32_t> g_redraws{0};
 
@@ -104,32 +97,10 @@ void OnVertexShaderCreated(ID3D11VertexShader* vs, const void* code, size_t leng
         known ? "known" : "detected", n);
 }
 
-void OnPixelShaderCreated(ID3D11PixelShader* ps, uint64_t hash) {
-  if (!ps) return;
-  if (hash == kMotionBlurPs) {
-    g_blur_ps.Insert(ps);
-    Log("object motion: motion blur PS found");
-  } else {
-    g_blur_ps.Erase(ps);
-  }
-}
-
 void OnSetVertexShader(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs) {
   const bool velocity = g_velocity_vs.Contains(vs);
   ContextSlot* slot = FindSlot(ctx, velocity);
   if (slot) slot->velocity.store(velocity, std::memory_order_relaxed);
-}
-
-void OnSetPixelShader(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps) {
-  const bool blur = g_blur_ps.Contains(ps);
-  ContextSlot* slot = FindSlot(ctx, blur);
-  if (slot) slot->blur.store(blur, std::memory_order_relaxed);
-}
-
-bool SkipDraw(ID3D11DeviceContext* ctx) {
-  if (!g_hide_blur.load(std::memory_order_relaxed)) return false;
-  const ContextSlot* slot = FindSlot(ctx, false);
-  return slot && slot->blur.load(std::memory_order_relaxed);
 }
 
 bool WantsRedraw(ID3D11DeviceContext* ctx) {
@@ -208,10 +179,7 @@ void End(ID3D11DeviceContext* ctx, SavedState* s) {
   release(s->blend);
 }
 
-void SetActive(bool active, bool hide_motion_blur) {
-  g_active.store(active, std::memory_order_relaxed);
-  g_hide_blur.store(active && hide_motion_blur, std::memory_order_relaxed);
-}
+void SetActive(bool active) { g_active.store(active, std::memory_order_relaxed); }
 
 bool Prepare(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UINT h,
              ID3D11Texture2D* scene_depth, float proj_z) {

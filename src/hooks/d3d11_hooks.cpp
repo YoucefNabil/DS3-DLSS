@@ -15,6 +15,7 @@
 #include "common/config.h"
 #include "camera/scene_camera.h"
 #include "common/log.h"
+#include "dlss/capture.h"
 #include "dlss/dlaa.h"
 #include "dlss/mip_bias.h"
 #include "dlss/object_motion.h"
@@ -22,6 +23,7 @@
 #include "hooks/frame_dump.h"
 #include "hooks/shader_registry.h"
 #include "hooks/vtable_indices.h"
+#include "tweaks/window.h"
 
 namespace ds3::hooks {
 namespace {
@@ -80,10 +82,7 @@ HRESULT STDMETHODCALLTYPE Hk_CreateVertexShader(ID3D11Device* self, const void* 
 HRESULT STDMETHODCALLTYPE Hk_CreatePixelShader(ID3D11Device* self, const void* code, SIZE_T len,
                                                ID3D11ClassLinkage* linkage, ID3D11PixelShader** out) {
   const HRESULT hr = o_CreatePixelShader(self, code, len, linkage, out);
-  if (SUCCEEDED(hr) && out) {
-    shaders::Register(*out, code, len, "ps");
-    object_motion::OnPixelShaderCreated(*out, shaders::HashBytecode(code, len));
-  }
+  if (SUCCEEDED(hr) && out) shaders::Register(*out, code, len, "ps");
   return hr;
 }
 
@@ -92,6 +91,7 @@ HRESULT STDMETHODCALLTYPE Hk_CreateComputeShader(ID3D11Device* self, const void*
                                                  ID3D11ComputeShader** out) {
   const HRESULT hr = o_CreateComputeShader(self, code, len, linkage, out);
   if (SUCCEEDED(hr) && out) shaders::Register(*out, code, len, "cs");
+  if (FAILED(hr)) Log("CreateComputeShader (%zu bytes) failed: 0x%08X", len, hr);
   return hr;
 }
 
@@ -116,8 +116,6 @@ HRESULT STDMETHODCALLTYPE Hk_CreateSamplerState(ID3D11Device* self, const D3D11_
 // contexts (1), in case d3d11.dll implements them with different code.
 
 using VSSetShaderFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11VertexShader*,
-                                               ID3D11ClassInstance* const*, UINT);
-using PSSetShaderFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11PixelShader*,
                                                ID3D11ClassInstance* const*, UINT);
 using PSSetSamplersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
                                                  ID3D11SamplerState* const*);
@@ -166,7 +164,6 @@ using UpdateSubresource1Fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3
 template <int Instance>
 struct ContextHooks {
   static inline VSSetShaderFn o_VSSetShader;
-  static inline PSSetShaderFn o_PSSetShader;
   static inline PSSetSamplersFn o_PSSetSamplers;
   static inline OMSetRenderTargetsFn o_OMSetRenderTargets;
   static inline OMSetRenderTargetsAndUavsFn o_OMSetRenderTargetsAndUavs;
@@ -194,12 +191,6 @@ struct ContextHooks {
                                             ID3D11ClassInstance* const* instances, UINT count) {
     object_motion::OnSetVertexShader(self, vs);
     o_VSSetShader(self, vs, instances, count);
-  }
-
-  static void STDMETHODCALLTYPE PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps,
-                                            ID3D11ClassInstance* const* instances, UINT count) {
-    object_motion::OnSetPixelShader(self, ps);
-    o_PSSetShader(self, ps, instances, count);
   }
 
   static void STDMETHODCALLTYPE PSSetSamplers(ID3D11DeviceContext* self, UINT start, UINT count,
@@ -244,12 +235,10 @@ struct ContextHooks {
   }
 
   // Draws after the game's own: motion-blur velocity draws are repeated into
-  // the full-resolution object-motion target (see dlss/object_motion.h). The
-  // blur draws themselves are skipped while hidden.
+  // the full-resolution object-motion target (see dlss/object_motion.h).
   static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* self, UINT vertices, UINT start) {
     dlaa::BeforeDraw(self);
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "Draw", vertices, 1);
-    if (object_motion::SkipDraw(self)) return;
     o_Draw(self, vertices, start);
     if (object_motion::WantsRedraw(self))
       object_motion::Redraw(self, [&] { o_Draw(self, vertices, start); });
@@ -260,7 +249,6 @@ struct ContextHooks {
   static void STDMETHODCALLTYPE DrawIndexed(ID3D11DeviceContext* self, UINT indices, UINT start,
                                             INT base) {
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "DrawIndexed", indices, 1);
-    if (object_motion::SkipDraw(self)) return;
     o_DrawIndexed(self, indices, start, base);
     if (object_motion::WantsRedraw(self))
       object_motion::Redraw(self, [&] { o_DrawIndexed(self, indices, start, base); });
@@ -271,7 +259,6 @@ struct ContextHooks {
   static void STDMETHODCALLTYPE DrawInstanced(ID3D11DeviceContext* self, UINT vertices,
                                               UINT instances, UINT start, UINT start_instance) {
     if (frame_dump::Active()) frame_dump::RecordDraw(self, "DrawInstanced", vertices, instances);
-    if (object_motion::SkipDraw(self)) return;
     o_DrawInstanced(self, vertices, instances, start, start_instance);
     if (object_motion::WantsRedraw(self))
       object_motion::Redraw(
@@ -286,7 +273,6 @@ struct ContextHooks {
                                                      UINT start_instance) {
     if (frame_dump::Active())
       frame_dump::RecordDraw(self, "DrawIndexedInstanced", indices, instances);
-    if (object_motion::SkipDraw(self)) return;
     o_DrawIndexedInstanced(self, indices, instances, start, base, start_instance);
     if (object_motion::WantsRedraw(self))
       object_motion::Redraw(self, [&] {
@@ -398,7 +384,6 @@ struct ContextHooks {
       HookSlot(ctx, slot, detour, original, name);
     };
     hook(kSlotCtx_VSSetShader, &VSSetShader, &o_VSSetShader, "VSSetShader");
-    hook(kSlotCtx_PSSetShader, &PSSetShader, &o_PSSetShader, "PSSetShader");
     hook(kSlotCtx_PSSetSamplers, &PSSetSamplers, &o_PSSetSamplers, "PSSetSamplers");
     hook(kSlotCtx_OMSetRenderTargets, &OMSetRenderTargets, &o_OMSetRenderTargets,
          "OMSetRenderTargets");
@@ -461,8 +446,10 @@ HRESULT STDMETHODCALLTYPE Hk_CreateDeferredContext(ID3D11Device* self, UINT flag
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT,
                                                     UINT);
+using SetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
 PresentFn o_Present;
 ResizeBuffersFn o_ResizeBuffers;
+SetFullscreenStateFn o_SetFullscreenState;
 
 bool KeyPressedOnce(int vk) {
   static bool was_down[256] = {};
@@ -496,6 +483,7 @@ HRESULT STDMETHODCALLTYPE Hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     frame_dump::Request();
   if (GameHasFocus() && KeyPressedOnce(GetConfig().dlss_toggle_key)) dlaa::Toggle();
   if (GameHasFocus() && KeyPressedOnce(GetConfig().dlss_mip_bias_key)) mip_bias::Toggle();
+  if (GameHasFocus() && KeyPressedOnce(GetConfig().capture_key)) capture::Request();
   frame_dump::OnPresent();
   camera::OnPresent();
   dlaa::OnPresent(self);
@@ -507,6 +495,12 @@ HRESULT STDMETHODCALLTYPE Hk_ResizeBuffers(IDXGISwapChain* self, UINT count, UIN
   const HRESULT hr = o_ResizeBuffers(self, count, width, height, format, flags);
   Log("ResizeBuffers(%u, %ux%u, fmt=%d) -> 0x%08X", count, width, height, format, hr);
   return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Hk_SetFullscreenState(IDXGISwapChain* self, BOOL fullscreen,
+                                                IDXGIOutput* target) {
+  window::OnFullscreenState(fullscreen);
+  return o_SetFullscreenState(self, fullscreen, target);
 }
 
 // ---- IDXGIFactory --------------------------------------------------------
@@ -598,6 +592,8 @@ void OnSwapChainCreated(IDXGISwapChain* swap_chain) {
     HookSlot(swap_chain, kSlotSwapChain_Present, &Hk_Present, &o_Present, "SwapChain::Present");
     HookSlot(swap_chain, kSlotSwapChain_ResizeBuffers, &Hk_ResizeBuffers, &o_ResizeBuffers,
              "SwapChain::ResizeBuffers");
+    HookSlot(swap_chain, kSlotSwapChain_SetFullscreenState, &Hk_SetFullscreenState,
+             &o_SetFullscreenState, "SwapChain::SetFullscreenState");
     ApplyQueued();
   });
 }

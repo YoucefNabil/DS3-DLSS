@@ -146,7 +146,10 @@ void Remember(const float* cb, uint32_t frame, float ox, float oy) {
   std::memcpy(g_snapshot.inv_view_proj, cb + kInvViewProj, sizeof(g_snapshot.inv_view_proj));
   std::memcpy(g_snapshot.view_proj, cb + kViewProj, sizeof(g_snapshot.view_proj));
   std::memcpy(g_snapshot.camera_pos, cb + kCameraPos, sizeof(g_snapshot.camera_pos));
-  g_snapshot.proj_z = cb[kProj + 10];
+  const float* proj = cb + kProj;
+  g_snapshot.proj_z = proj[10];
+  g_snapshot.near_plane = proj[10] != 0.0f ? -proj[11] / proj[10] : 0.0f;
+  g_snapshot.fov_y = proj[5] > 0.0f ? 2.0f * std::atan(1.0f / proj[5]) : 0.0f;
   g_have_snapshot = true;
 }
 

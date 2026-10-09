@@ -28,6 +28,7 @@ RWTexture2D<float2> g_MotionVectors : register(u0);  // pixels, current -> previ
 RWTexture2D<float> g_DepthOut : register(u1);        // depth copy DLSS can read
 RWTexture2D<float4> g_Debug : register(u2);
 RWTexture2D<float> g_Bias : register(u3);  // DLSS "bias current colour" mask
+RWTexture2D<float> g_Object : register(u4);  // 1 = object motion (characters), for captures
 
 float3 Compress(float3 c) {
   c = max(c, 0.0);
@@ -94,6 +95,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   g_MotionVectors[id.xy] = mv;
   g_DepthOut[id.xy] = depth;
   g_Bias[id.xy] = bias;
+  g_Object[id.xy] = object ? 1.0 : 0.0;
   if (g_DebugView == 1)
     g_Debug[id.xy] = float4(abs(mv) * 0.25, object ? 1.0 : (depth >= 1.0 ? 0.25 : 0.0), 1.0);
   else if (g_DebugView == 2)

@@ -54,3 +54,5 @@ EXPORTS
   D3DPerformance_EndEvent                   = stub_D3DPerformance_EndEvent                   @49
   D3DPerformance_GetStatus                  = stub_D3DPerformance_GetStatus                  @50
   D3DPerformance_SetMarker                  = stub_D3DPerformance_SetMarker                  @51
+  ; Not in System32\d3d11.dll: runs a captured frame (tools/capture_replay).
+  DS3_DLSS_ReplayFrame
