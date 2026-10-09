@@ -5,7 +5,7 @@
 #include <atomic>
 #include <mutex>
 
-#include "common/log.h"
+#include "core.h"
 
 using Microsoft::WRL::ComPtr;
 

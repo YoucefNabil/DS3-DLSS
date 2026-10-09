@@ -10,7 +10,7 @@
 #include <cstring>
 
 #include "common/config.h"
-#include "common/log.h"
+#include "core.h"
 
 namespace ds3::frame_rate {
 namespace {

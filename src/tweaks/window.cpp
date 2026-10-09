@@ -4,7 +4,7 @@
 #include <cwchar>
 
 #include "common/config.h"
-#include "common/log.h"
+#include "core.h"
 #include "tweaks/game_memory.h"
 
 namespace ds3::window {

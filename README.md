@@ -15,9 +15,10 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 build\Release\smoke_test.exe "%CD%\build\Release\d3d11.dll"   # expects "Present: 0x00000000" and "OK"
 ```
-Clone with submodules (`git submodule update --init`).
-Requirements: VS 2022 Build Tools, the Windows 10/11 SDK (for `fxc`), and the NVIDIA DLSS SDK
-(`-DDLSS_SDK_DIR=...`; see `CMakeLists.txt` for the default path).
+The proxy, D3D11 hooks, NGX, frame dump and shader registry come from the shared
+[dlaa-core](https://github.com/YoucefNabil/dlaa-core) library, which also holds MinHook and the
+DLSS SDK. Check it out next to this repo (`..\dlaa-core`), or pass `-DDLAA_CORE_DIR=...`.
+Requirements: VS 2022 Build Tools and the Windows 10/11 SDK (for `fxc`).
 
 ### DLAA test (no game needed)
 `dlaa_test` simulates DS3's frame (cbSceneParam, depth clear, PS `393A947C35535471`) at 640x360.
@@ -63,7 +64,7 @@ Copy `build\Release\d3d11.dll` and `DS3_DLSS.ini` next to `DarkSoulsIII.exe`.
 Uninstall by deleting both files. `Enabled=0` in the ini turns it into a pure pass-through.
 
 It doesn't touch `dinput8.dll` (Blue Sentinel), `SeamlessCoop\`, or any game file.
-It only writes `DS3_DLSS.log`, `DS3_DLSS_frame_*.txt` and (optionally) `DS3_DLSS_shaders` in the Game folder.
+It only writes `DS3_DLSS.log`, `DS3_DLSS_frame_*.txt`/`.cb` and (optionally) `DS3_DLSS_shaders` in the Game folder.
 The optional `[Widescreen]`, `[FrameRate]` and `[Window]` sections (off by default) are the exception: see below.
 NGX writes its own logs there too; its lines are also mirrored into `DS3_DLSS.log`.
 
@@ -170,6 +171,8 @@ sprint maths at 30-360 fps, and runs the borderless window hooks end to end on a
    in the frame with VS/PS/CS hashes, render targets, depth, viewport, and the SRVs each pass reads.
    Resource ids (`T12`) are described at the end of the file. Work recorded on deferred
    contexts is spliced in (lines starting with `|`) under the `ExecuteCommandList` that runs it.
+   Constant-buffer upload bytes go to `DS3_DLSS_frame_<time>.cb` (read it with
+   `..\dlaa-core	ools\cbdump.py`).
    With `[Debug] DumpShaders=1`, every shader the game creates is also saved to
    `DS3_DLSS_shaders\<hash>.<vs|ps|cs>.cso` for disassembly (set it before launching).
 3. Take one dump with in-game **Anti-aliasing On** and one with it **Off**, and one with
@@ -177,9 +180,9 @@ sprint maths at 30-360 fps, and runs the borderless window hooks end to end on a
 4. Make a RenderDoc capture of the same spot for pixel-level inspection.
 
 ## Layout
-- `src/proxy/`: export table (`exports.def`, `export_stubs.asm`) and device-creation interception
-- `src/hooks/`: MinHook vtable hooks, shader-hash registry, frame dump
-- `src/common/`: log + ini
+- `src/game.cpp`: plugs DS3 into dlaa-core: hook callbacks, hotkeys, exe tweaks at attach
+- `src/core.h`: the dlaa-core modules under `ds3::` names
+- `src/common/`: ini
 - `src/camera/`: cbSceneParam tracking and jitter
 - `src/dlss/`: DLAA (NGX D3D11) and `mv_from_depth.hlsl`
 - `src/widescreen/`: `[Widescreen]` resolution table entry, config follow

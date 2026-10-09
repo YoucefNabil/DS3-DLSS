@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "common/config.h"
-#include "common/log.h"
+#include "core.h"
 
 using Microsoft::WRL::ComPtr;
 

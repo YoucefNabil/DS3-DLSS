@@ -3,7 +3,7 @@
 #include <windows.h>
 #include <cmath>
 
-#include "common/log.h"
+#include "core.h"
 
 namespace ds3 {
 namespace {
@@ -88,6 +88,15 @@ void LoadConfig() {
       g_config.widescreen_width, g_config.widescreen_height, g_config.widescreen_follow_display);
   Log("config: FrameRate Unlock=%d FPS=%.1f, Window Borderless=%d", g_config.frame_rate_unlock,
       g_config.frame_rate_fps, g_config.window_borderless);
+
+  dlaa_core::CoreConfig& core = dlaa_core::MutableCoreConfig();
+  core.enabled = g_config.enabled;
+  core.debug_tools = g_config.debug;
+  core.dump_frame_key = g_config.dump_frame_key;
+  core.dump_frame_at = g_config.dump_frame_at;
+  core.dump_shaders = g_config.dump_shaders;
+  core.capture_frames = g_config.capture_frames;
+  core.mip_bias = g_config.dlss ? g_config.dlss_mip_bias : 0.0f;
 }
 
 }  // namespace ds3

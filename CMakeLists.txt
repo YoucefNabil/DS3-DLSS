@@ -5,50 +5,24 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "DS3 is x64 only: configure with -A x64")
 endif()
 
-# Static CRT so the mod has no redistributable dependency.
+# Static CRT for the tests and tools too (the mod gets it from dlaa_core_add_mod).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_subdirectory(external/minhook EXCLUDE_FROM_ALL)
+# Shared proxy / hooks / NGX (C:\_APPS\CLAUDE\dlaa-core).
+set(DLAA_CORE_DIR ${CMAKE_SOURCE_DIR}/../dlaa-core CACHE PATH "dlaa-core checkout")
+add_subdirectory(${DLAA_CORE_DIR} dlaa_core)
 
-# NVIDIA DLSS SDK (external/dlss): NGX headers + static-CRT import library.
-set(DLSS_SDK_DIR ${CMAKE_SOURCE_DIR}/external/dlss)
-set(NGX_LIB_DIR ${DLSS_SDK_DIR}/lib/Windows_x86_64/x64)
-
-# Motion-vector compute shader, precompiled with fxc into a header.
-file(GLOB FXC_DIRS LIST_DIRECTORIES true "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64")
-list(SORT FXC_DIRS COMPARE NATURAL ORDER DESCENDING)
-find_program(FXC_EXECUTABLE fxc HINTS ${FXC_DIRS} REQUIRED)
-set(SHADER_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
-function(compile_shader source profile variable header)
-  add_custom_command(
-    OUTPUT ${SHADER_OUT_DIR}/${header}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT_DIR}
-    COMMAND ${FXC_EXECUTABLE} /nologo /T ${profile} /E main /O3 /Vn ${variable}
-            /Fh ${SHADER_OUT_DIR}/${header} ${CMAKE_SOURCE_DIR}/${source}
-    DEPENDS ${CMAKE_SOURCE_DIR}/${source}
-    COMMENT "fxc ${source}"
-    VERBATIM)
-endfunction()
-compile_shader(src/dlss/mv_from_depth.hlsl cs_5_0 kMvFromDepthCs mv_from_depth.h)
-compile_shader(src/dlss/object_motion.hlsl ps_5_0 kObjectMotionPs object_motion_ps.h)
-compile_shader(src/dlss/debug_blit_vs.hlsl vs_5_0 kDebugBlitVs debug_blit_vs.h)
-compile_shader(src/dlss/debug_blit_ps.hlsl ps_5_0 kDebugBlitPs debug_blit_ps.h)
+# Our shaders, precompiled with fxc into headers.
+dlaa_core_compile_shader(src/dlss/mv_from_depth.hlsl cs_5_0 kMvFromDepthCs mv_from_depth.h)
+dlaa_core_compile_shader(src/dlss/object_motion.hlsl ps_5_0 kObjectMotionPs object_motion_ps.h)
 
 add_library(ds3_dlss SHARED
-  src/proxy/dllmain.cpp
-  src/proxy/export_stubs.asm
-  src/proxy/exports.def
-  src/common/log.cpp
+  src/game.cpp
   src/common/config.cpp
-  src/hooks/vtable_indices.c
-  src/hooks/d3d11_hooks.cpp
-  src/hooks/frame_dump.cpp
-  src/hooks/shader_registry.cpp
   src/camera/scene_camera.cpp
   src/dlss/dlaa.cpp
-  src/dlss/mip_bias.cpp
   src/dlss/object_motion.cpp
   src/dlss/reactive.cpp
   src/dlss/capture.cpp
@@ -56,21 +30,8 @@ add_library(ds3_dlss SHARED
   src/tweaks/game_memory.cpp
   src/tweaks/frame_rate.cpp
   src/tweaks/window.cpp
-  ${SHADER_OUT_DIR}/mv_from_depth.h
-  ${SHADER_OUT_DIR}/object_motion_ps.h
-  ${SHADER_OUT_DIR}/debug_blit_vs.h
-  ${SHADER_OUT_DIR}/debug_blit_ps.h
 )
-
-set_target_properties(ds3_dlss PROPERTIES OUTPUT_NAME "d3d11")
-target_include_directories(ds3_dlss PRIVATE src ${SHADER_OUT_DIR})
-target_include_directories(ds3_dlss SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
-target_compile_definitions(ds3_dlss PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(ds3_dlss PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/W4 /permissive- /utf-8>)
-# SDK headers use nameless unions in their C-mode COM declarations (vtable_indices.c).
-set_source_files_properties(src/hooks/vtable_indices.c PROPERTIES COMPILE_OPTIONS /wd4201)
-target_link_libraries(ds3_dlss PRIVATE minhook dxguid
-  ${NGX_LIB_DIR}/nvsdk_ngx_s$<$<CONFIG:Debug>:_dbg>.lib)
+dlaa_core_add_mod(ds3_dlss SHADERS mv_from_depth object_motion_ps)
 
 # Standalone smoke test: loads the built proxy and drives device/swap-chain creation.
 add_executable(smoke_test tests/smoke_test.cpp)
@@ -82,17 +43,17 @@ target_link_libraries(dlaa_test PRIVATE dxgi d3dcompiler)
 
 # [Widescreen] table search and GraphicsConfig.xml rewrite.
 add_executable(widescreen_test tests/widescreen_test.cpp src/widescreen/widescreen.cpp
-  src/common/config.cpp src/common/log.cpp)
+  src/common/config.cpp)
 target_include_directories(widescreen_test PRIVATE src)
-target_compile_definitions(widescreen_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+dlaa_core_target_defaults(widescreen_test)
+target_link_libraries(widescreen_test PRIVATE dlaa_core)
 
 # [FrameRate] / [Window] code search on the real exe, sprint factors, window maths.
 add_executable(tweaks_test tests/tweaks_test.cpp src/tweaks/game_memory.cpp
-  src/tweaks/frame_rate.cpp src/tweaks/window.cpp src/common/config.cpp src/common/log.cpp)
+  src/tweaks/frame_rate.cpp src/tweaks/window.cpp src/common/config.cpp)
 target_include_directories(tweaks_test PRIVATE src)
-target_compile_definitions(tweaks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(tweaks_test PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(tweaks_test PRIVATE minhook)
+dlaa_core_target_defaults(tweaks_test)
+target_link_libraries(tweaks_test PRIVATE dlaa_core)
 
 # Constant-buffer listing of the dumped game shaders (camera-matrix audit).
 add_executable(cb_scan tools/cb_scan.cpp)
@@ -101,6 +62,5 @@ target_link_libraries(cb_scan PRIVATE d3dcompiler dxguid)
 # Offline replay of a [Debug] CaptureKey capture through DLSS, with metrics.
 add_executable(capture_replay tools/capture_replay.cpp)
 target_include_directories(capture_replay PRIVATE src)
-target_compile_definitions(capture_replay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(capture_replay PRIVATE /W4 /permissive- /utf-8)
+dlaa_core_target_defaults(capture_replay)
 target_link_libraries(capture_replay PRIVATE windowscodecs ole32)

@@ -13,7 +13,7 @@
 #include <string>
 
 #include "common/config.h"
-#include "common/log.h"
+#include "core.h"
 #include "tweaks/frame_rate.h"
 #include "tweaks/game_memory.h"
 #include "tweaks/window.h"
@@ -152,8 +152,9 @@ static LRESULT CALLBACK TestWndProc(HWND hwnd, UINT message, WPARAM wparam, LPAR
 
 // Runs in the temp copy, with [Window] Borderless=1 in its ini.
 static void WindowEndToEnd() {
-  SetSelfModule(GetModuleHandleW(nullptr));
-  LogInit();
+  dlaa_core::SetSelfModule(GetModuleHandleW(nullptr));
+  dlaa_core::SetPrefix(L"DS3_DLSS");
+  dlaa_core::LogInit();
   LoadConfig();
   window::Apply();
 
