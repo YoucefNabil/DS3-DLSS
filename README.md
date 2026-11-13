@@ -190,4 +190,4 @@ sprint maths at 30-360 fps, and runs the borderless window hooks end to end on a
 - `tests/dlaa_test.cpp`: DLAA pipeline tests outside the game
 - `tools/cb_scan.cpp`: lists every cbuffer variable of a shader dump (camera matrix audit)
 - `tools/capture_replay.cpp`: runs a `[Debug] CaptureKey` capture through DLSS, with metrics
-- `tests/smoke_test.cpp`: drives the proxy outside the game
+- `..\dlaa-core\tests\smoke_test.cpp` (built here as `smoke_test`): drives the proxy outside the game

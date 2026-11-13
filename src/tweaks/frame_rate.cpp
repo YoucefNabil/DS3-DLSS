@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 
 #include "common/config.h"
 #include "core.h"
@@ -63,11 +64,34 @@ void InstallSprintFix(Range code) {
     return;
   }
   // The operands first (with 60 fps values in place the game behaves as before),
-  // then the hook that keeps them up to date.
-  game_memory::Redirect(site.speed_disp, &g_factors->speed_scale);
-  game_memory::Redirect(site.slowdown_disp, &g_factors->slowdown);
-  game_memory::Redirect(site.recovery_disp, &g_factors->recovery);
-  status = MH_EnableHook(site.function);
+  // then the hook that keeps them up to date. All or nothing: if any step
+  // fails, the game's code is put back as it was.
+  struct Operand {
+    uint8_t* disp;
+    const float* target;
+    int32_t original;
+  } operands[] = {{site.speed_disp, &g_factors->speed_scale, 0},
+                  {site.slowdown_disp, &g_factors->slowdown, 0},
+                  {site.recovery_disp, &g_factors->recovery, 0}};
+  size_t redirected = 0;
+  for (Operand& o : operands) {
+    std::memcpy(&o.original, o.disp, sizeof(o.original));
+    if (!game_memory::Redirect(o.disp, o.target)) break;
+    ++redirected;
+  }
+  const bool operands_ok = redirected == std::size(operands);
+  status = operands_ok ? MH_EnableHook(site.function) : MH_ERROR_MEMORY_PROTECT;
+  if (status != MH_OK) {
+    bool restored = true;
+    for (size_t i = 0; i < redirected; ++i)
+      restored &= game_memory::Write(operands[i].disp, &operands[i].original,
+                                     sizeof(operands[i].original));
+    MH_RemoveHook(site.function);
+    Log("frame rate: sprint fix not installed (%s), game code %s",
+        operands_ok ? MH_StatusToString(status) : "operand write failed",
+        restored ? "restored" : "NOT fully restored: it keeps its 60 fps sprint values");
+    return;
+  }
   Log("frame rate: sprint fix at exe+0x%llX, factors at %p: %s",
       static_cast<unsigned long long>(site.function - base), static_cast<void*>(g_factors),
       MH_StatusToString(status));

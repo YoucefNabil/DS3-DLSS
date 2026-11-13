@@ -4,12 +4,7 @@
 #include <d3d11_1.h>
 #include <wrl/client.h>
 
-#include <nvsdk_ngx.h>
-#include <nvsdk_ngx_helpers_d3d.h>
-
-#include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -72,14 +67,19 @@ bool g_reset = true;
 ComPtr<ID3D11ComputeShader> g_cs;
 ComPtr<ID3D11Buffer> g_cb;
 ComPtr<ID3D11SamplerState> g_linear;  // DebugView 3
-NVSDK_NGX_Parameter* g_params = nullptr;
-NVSDK_NGX_Handle* g_feature = nullptr;
-UINT g_feature_w = 0, g_feature_h = 0;
+ngx::Dlaa g_feature;
 camera::Snapshot g_prev;
 bool g_have_prev = false;
 int g_eval_failures = 0;
 LARGE_INTEGER g_last_eval = {};  // frame time, for capture records
 bool g_debug_frame = false;  // g_t.out holds a DebugView image for the next Present
+// The camera jitter is only wanted while DLAA takes it out again. A frame whose
+// scene never reached Process (no depth yet, a size mismatch, a menu without
+// the post pass) pauses the jitter until one does; that frame is then
+// processed unjittered and the jitter resumes with the next.
+bool g_processed = false;  // this frame's scene reached Process
+bool g_jittering = false;
+uint32_t g_jitter_pauses = 0;
 
 // History resets by reason, and evaluated frames, since the last OnPresent summary.
 // Frequent resets look like flicker, so they are logged (rate-limited).
@@ -114,37 +114,6 @@ void Warn(Warning w, const char* message) {
   if (g_warned[w]) return;
   g_warned[w] = true;
   Log("DLAA: %s (logged once)", message);
-}
-
-void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
-  std::string m = message ? message : "";
-  while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.pop_back();
-  Log("NGX: %s", m.c_str());
-}
-
-// Gauss-Jordan with partial pivoting; m and out are rows of a 4x4 matrix.
-bool Invert(const double* m, double* out) {
-  double a[4][8];
-  for (int r = 0; r < 4; ++r)
-    for (int c = 0; c < 8; ++c) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.0 : 0.0);
-  for (int c = 0; c < 4; ++c) {
-    int pivot = c;
-    for (int r = c + 1; r < 4; ++r)
-      if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
-    if (std::fabs(a[pivot][c]) < 1e-12) return false;
-    if (pivot != c)
-      for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[pivot][k]);
-    const double inv = 1.0 / a[c][c];
-    for (int k = 0; k < 8; ++k) a[c][k] *= inv;
-    for (int r = 0; r < 4; ++r) {
-      if (r == c || a[r][c] == 0.0) continue;
-      const double f = a[r][c];
-      for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
-    }
-  }
-  for (int r = 0; r < 4; ++r)
-    for (int c = 0; c < 4; ++c) out[r * 4 + c] = a[r][c + 4];
-  return true;
 }
 
 // Unjittered NDC of `cur` -> clip space of `prev`: inverse of this frame's
@@ -199,37 +168,6 @@ void SelfCheck(const camera::Snapshot& s) {
       clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]);
 }
 
-bool InitNgx(ID3D11Device* device) {
-  static const std::wstring dir = ModuleDir();
-  static const wchar_t* paths[] = {dir.c_str()};
-  NVSDK_NGX_FeatureCommonInfo info = {};
-  info.PathListInfo.Path = paths;
-  info.PathListInfo.Length = 1;
-  info.LoggingInfo.LoggingCallback = &NgxLog;
-  info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
-  NVSDK_NGX_Result r = NVSDK_NGX_D3D11_Init_with_ProjectID(
-      kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dir.c_str(), device, &info);
-  if (NVSDK_NGX_FAILED(r)) {
-    Log("DLAA: NGX init failed: 0x%08X", r);
-    return false;
-  }
-  r = NVSDK_NGX_D3D11_GetCapabilityParameters(&g_params);
-  if (NVSDK_NGX_FAILED(r) || !g_params) {
-    Log("DLAA: NGX GetCapabilityParameters failed: 0x%08X", r);
-    return false;
-  }
-  int available = 0, needs_driver = 0;
-  NVSDK_NGX_Parameter_GetI(g_params, NVSDK_NGX_Parameter_SuperSampling_Available, &available);
-  NVSDK_NGX_Parameter_GetI(g_params, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver,
-                           &needs_driver);
-  if (!available) {
-    Log("DLAA: DLSS not available on this system (needs updated driver: %d)", needs_driver);
-    return false;
-  }
-  Log("DLAA: NGX ready");
-  return true;
-}
-
 bool InitD3D(ID3D11Device* device) {
   HRESULT hr = device->CreateComputeShader(kMvFromDepthCs, sizeof(kMvFromDepthCs), nullptr, &g_cs);
   if (SUCCEEDED(hr)) {
@@ -248,21 +186,6 @@ bool InitD3D(ID3D11Device* device) {
   }
   if (FAILED(hr)) Log("DLAA: D3D11 setup failed: 0x%08X", hr);
   return SUCCEEDED(hr);
-}
-
-HRESULT MakeTexture(ID3D11Device* device, UINT w, UINT h, DXGI_FORMAT format, UINT bind,
-                    ComPtr<ID3D11Texture2D>* out) {
-  D3D11_TEXTURE2D_DESC d = {};
-  d.Width = w;
-  d.Height = h;
-  d.MipLevels = 1;
-  d.ArraySize = 1;
-  d.Format = format;
-  d.SampleDesc.Count = 1;
-  d.Usage = D3D11_USAGE_DEFAULT;
-  d.BindFlags = bind;
-  out->Reset();
-  return device->CreateTexture2D(&d, nullptr, out->GetAddressOf());
 }
 
 bool EnsureTargets(ID3D11Device* device, UINT w, UINT h, bool typeless_color) {
@@ -315,86 +238,15 @@ bool EnsureTargets(ID3D11Device* device, UINT w, UINT h, bool typeless_color) {
 }
 
 bool EnsureFeature(ID3D11DeviceContext* ctx, UINT w, UINT h) {
-  if (g_feature && g_feature_w == w && g_feature_h == h) return true;
-  if (g_feature) NVSDK_NGX_D3D11_ReleaseFeature(g_feature);
-  g_feature = nullptr;
-  const int preset = GetConfig().dlss_preset;
-  if (preset > 0)
-    NVSDK_NGX_Parameter_SetUI(g_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
-                              static_cast<unsigned int>(preset));
-  NVSDK_NGX_DLSS_Create_Params p = {};
-  p.Feature.InWidth = w;
-  p.Feature.InHeight = h;
-  p.Feature.InTargetWidth = w;
-  p.Feature.InTargetHeight = h;
-  p.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
-  p.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-                           NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                           NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-  const NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_feature, g_params, &p);
-  if (NVSDK_NGX_FAILED(r)) {
-    Log("DLAA: creating the DLSS feature (%ux%u) failed: 0x%08X", w, h, r);
-    g_feature = nullptr;
-    return false;
-  }
-  g_feature_w = w;
-  g_feature_h = h;
-  g_reset = true;
-  Log("DLAA: DLSS feature created, %ux%u, preset %d", w, h, preset);
+  ngx::FeatureDesc desc;
+  desc.width = w;
+  desc.height = h;
+  desc.preset = GetConfig().dlss_preset;
+  bool recreated = false;
+  if (!g_feature.Ensure(ctx, desc, "DLAA", &recreated)) return false;
+  if (recreated) g_reset = true;
   return true;
 }
-
-// The game's compute-stage bindings, which our pass and NGX overwrite. Only
-// compute work and copies run in between, so nothing else needs saving.
-// (SwapDeviceContextState was tried first: on NVIDIA drivers the game's next
-// draw then ran without its vertex shader and hung the GPU.)
-class ComputeState {
- public:
-  explicit ComputeState(ID3D11DeviceContext* ctx) : ctx_(ctx) {
-    ComPtr<ID3D11Device> device;
-    ctx->GetDevice(&device);
-    uav_count_ = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ? D3D11_1_UAV_SLOT_COUNT
-                                                                     : D3D11_PS_CS_UAV_REGISTER_COUNT;
-    instance_count_ = D3D11_SHADER_MAX_INTERFACES;
-    ctx->CSGetShader(&shader_, instances_, &instance_count_);
-    ctx->CSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srvs_);
-    ctx->CSGetUnorderedAccessViews(0, uav_count_, uavs_);
-    ctx->CSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, cbs_);
-    ctx->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers_);
-  }
-  ~ComputeState() {
-    ctx_->CSSetShader(shader_, instances_, instance_count_);
-    ctx_->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srvs_);
-    UINT keep_counts[D3D11_1_UAV_SLOT_COUNT];
-    for (UINT& c : keep_counts) c = UINT(-1);
-    ctx_->CSSetUnorderedAccessViews(0, uav_count_, uavs_, keep_counts);
-    ctx_->CSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, cbs_);
-    ctx_->CSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, samplers_);
-    Release(shader_);
-    for (UINT i = 0; i < instance_count_; ++i) Release(instances_[i]);
-    for (auto* p : srvs_) Release(p);
-    for (auto* p : uavs_) Release(p);
-    for (auto* p : cbs_) Release(p);
-    for (auto* p : samplers_) Release(p);
-  }
-  ComputeState(const ComputeState&) = delete;
-  ComputeState& operator=(const ComputeState&) = delete;
-
- private:
-  template <typename T>
-  static void Release(T* p) {
-    if (p) p->Release();
-  }
-  ID3D11DeviceContext* ctx_;
-  UINT uav_count_;
-  UINT instance_count_;
-  ID3D11ComputeShader* shader_ = nullptr;
-  ID3D11ClassInstance* instances_[D3D11_SHADER_MAX_INTERFACES] = {};
-  ID3D11ShaderResourceView* srvs_[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
-  ID3D11UnorderedAccessView* uavs_[D3D11_1_UAV_SLOT_COUNT] = {};
-  ID3D11Buffer* cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
-  ID3D11SamplerState* samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
-};
 
 // Our own bindings must not stay behind: the depth copy and motion vectors
 // would otherwise remain bound as the game continues.
@@ -435,7 +287,7 @@ bool Init(ID3D11Device* device, const camera::Snapshot& cur) {
     Fail();
     return false;
   }
-  if (!InitNgx(device)) {
+  if (!ngx::Init(device, kProjectId)) {
     Fail();
     return false;
   }
@@ -482,155 +334,188 @@ std::string FrameRecord(const FrameInputs& in, const CsParams& p, const bool rea
   return s;
 }
 
-// Motion vectors, reactive mask and DLSS for one frame; the result goes
-// back into in.color. Returns whether DLSS ran.
-bool Process(ID3D11DeviceContext* ctx, ID3D11Device* device, FrameInputs& in, bool typeless) {
-  ID3D11Texture2D* const color = in.color;
-  const camera::Snapshot& cur = in.cur;
-  const UINT width = g_t.w, height = g_t.h;
-  ID3D11ShaderResourceView* const object_srv = in.object_srv;
-  ID3D11ShaderResourceView* effects_srv = in.effects_srv;
-  const float reactive_strength = GetConfig().dlss_reactive;
-  ID3D11Resource* scene_source = typeless ? g_t.color_in.Get() : color;
-  // The scene colour as a shader resource: for the reactive mask and DebugView 3.
-  const int debug_view = GetConfig().dlss_debug_view;
-  const bool motion_check = debug_view == 3;
-  if ((effects_srv || motion_check) && g_t.color_srv_source != scene_source) {
+// Why DLSS drops its history this frame.
+struct Reset {
+  bool requested = false;  // toggled, feature recreated, or no previous frame
+  bool gap = false;        // a frame was skipped
+  bool size = false;       // the render size changed
+  bool jump = false;       // the camera teleported
+  bool Any() const { return requested || gap || size || jump; }
+};
+
+Reset DecideReset(const camera::Snapshot& cur) {
+  const float dx = cur.camera_pos[0] - g_prev.camera_pos[0];
+  const float dy = cur.camera_pos[1] - g_prev.camera_pos[1];
+  const float dz = cur.camera_pos[2] - g_prev.camera_pos[2];
+  Reset r;
+  r.requested = g_reset || !g_have_prev;
+  r.gap = !r.requested && g_prev.frame + 1 != cur.frame;
+  r.size = !r.requested && (g_prev.width != cur.width || g_prev.height != cur.height);
+  r.jump = !r.requested && dx * dx + dy * dy + dz * dz > kResetDistance * kResetDistance;
+  g_stats.requested += r.requested;
+  g_stats.gap += r.gap;
+  g_stats.size += r.size;
+  g_stats.jump += r.jump;
+  ++g_stats.evaluated;
+  return r;
+}
+
+// The scene colour as a shader resource (reactive mask, DebugView 3), or null.
+ID3D11ShaderResourceView* SceneColorView(ID3D11Device* device, ID3D11Resource* scene_source) {
+  if (g_t.color_srv_source != scene_source) {
     g_t.color_srv.Reset();
     g_t.color_srv_source = scene_source;
     if (FAILED(device->CreateShaderResourceView(scene_source, nullptr, &g_t.color_srv)))
       Log("DLAA: scene colour view failed");
   }
-  if (!g_t.color_srv) effects_srv = nullptr;
-  in.effects_srv = effects_srv;
+  return g_t.color_srv.Get();
+}
+
+CsParams MotionParams(const FrameInputs& in, bool reset, int debug_view) {
+  const camera::Snapshot& cur = in.cur;
+  CsParams params = {};
+  CurToPrev(cur, reset ? cur : g_prev, params.cur_to_prev);
+  params.jitter_ndc[0] = 2.0f * cur.jitter_x / cur.width;
+  params.jitter_ndc[1] = -2.0f * cur.jitter_y / cur.height;
+  params.size[0] = cur.width;
+  params.size[1] = cur.height;
+  params.debug_view = static_cast<uint32_t>(debug_view);
+  params.use_object_motion = in.object_srv && !reset ? 1 : 0;
+  params.proj_z = cur.proj_z;
+  params.reactive = in.effects_srv && !reset ? GetConfig().dlss_reactive : 0.0f;
+  params.jitter_px[0] = cur.jitter_x;
+  params.jitter_px[1] = cur.jitter_y;
+  params.prev_jitter_px[0] = reset ? cur.jitter_x : g_prev.jitter_x;
+  params.prev_jitter_px[1] = reset ? cur.jitter_y : g_prev.jitter_y;
+  return params;
+}
+
+// Runs mv_from_depth: motion vectors, the depth copy, the reactive mask, the
+// object mask and (DebugView) the overlay image. `scene_srv` is null unless
+// the reactive mask or DebugView 3 needs the scene colour.
+void WriteMotion(ID3D11DeviceContext* ctx, const FrameInputs& in, const CsParams& params,
+                 ID3D11ShaderResourceView* scene_srv, bool motion_check) {
+  ctx->UpdateSubresource(g_cb.Get(), 0, nullptr, &params, 0, 0);
+  ctx->CopyResource(g_t.depth_copy.Get(), in.depth);
+  ID3D11UnorderedAccessView* uavs[5] = {g_t.mv_uav.Get(), g_t.depth_uav.Get(), g_t.out_uav.Get(),
+                                        g_t.bias_uav.Get(), g_t.object_uav.Get()};
+  ID3D11ShaderResourceView* srvs[5] = {g_t.depth_srv.Get(), in.object_srv, in.effects_srv,
+                                       scene_srv,
+                                       motion_check ? g_t.prev_color_srv.Get() : nullptr};
+  ctx->CSSetShader(g_cs.Get(), nullptr, 0);
+  ctx->CSSetShaderResources(0, 5, srvs);
+  if (motion_check) ctx->CSSetSamplers(0, 1, g_linear.GetAddressOf());
+  ctx->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
+  ctx->CSSetConstantBuffers(0, 1, g_cb.GetAddressOf());
+  ctx->Dispatch((g_t.w + 7) / 8, (g_t.h + 7) / 8, 1);
+  UnbindCompute(ctx);
+}
+
+// F9 capture: everything DLSS is about to get.
+void GrabInputs(ID3D11DeviceContext* ctx, const FrameInputs& in, ID3D11Resource* scene_source) {
+  auto resource = [](ID3D11ShaderResourceView* srv) {
+    ComPtr<ID3D11Resource> r;
+    if (srv) srv->GetResource(&r);
+    return r;
+  };
+  capture::Grab(ctx, capture::kColor, scene_source);
+  capture::Grab(ctx, capture::kDepth, g_t.depth_copy.Get());
+  capture::Grab(ctx, capture::kObjectMotion, resource(in.object_srv).Get());
+  capture::Grab(ctx, capture::kEffects, resource(in.effects_srv).Get());
+  capture::Grab(ctx, capture::kMotion, g_t.mv.Get());
+  capture::Grab(ctx, capture::kBias, g_t.bias.Get());
+  capture::Grab(ctx, capture::kObject, g_t.object.Get());
+}
+
+// Frame time for the capture record: the replay's, or measured between evaluates.
+double FrameMs(const FrameInputs& in) {
+  if (in.frame_ms > 0.0f) return in.frame_ms;
+  LARGE_INTEGER now, freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  const double ms = g_last_eval.QuadPart
+                        ? 1000.0 * (now.QuadPart - g_last_eval.QuadPart) / freq.QuadPart
+                        : 16.7;
+  g_last_eval = now;
+  return ms;
+}
+
+// DLSS on `input`; the result is copied into the scene colour. False when it failed.
+bool RunDlss(ID3D11DeviceContext* ctx, const FrameInputs& in, ID3D11Resource* input,
+             bool with_bias, bool reset) {
+  ngx::EvalInputs e;
+  e.color = input;
+  e.output = g_t.out.Get();
+  e.depth = g_t.depth.Get();
+  e.motion = g_t.mv.Get();
+  e.jitter_x = GetConfig().dlss_jitter_sign * in.cur.jitter_x;
+  e.jitter_y = GetConfig().dlss_jitter_sign * in.cur.jitter_y;
+  e.reset = reset;
+  if (with_bias) e.bias_mask = g_t.bias.Get();
+  const int r = g_feature.Evaluate(ctx, e);
+  if (!ngx::Succeeded(r)) {
+    char message[64];
+    std::snprintf(message, sizeof(message), "DLSS evaluate failed: 0x%08X", r);
+    Warn(kWarnEvaluate, message);
+    return false;
+  }
+  ctx->CopyResource(in.color, g_t.out.Get());
+  g_eval_failures = 0;
+  return true;
+}
+
+// Motion vectors, reactive mask and DLSS for one frame; the result goes
+// back into in.color. Returns whether DLSS ran.
+bool Process(ID3D11DeviceContext* ctx, ID3D11Device* device, FrameInputs& in, bool typeless) {
+  // A typeless scene cannot be read directly: DLSS and our shader get a typed copy.
+  ID3D11Resource* const scene_source = typeless ? g_t.color_in.Get() : in.color;
+  const int debug_view = GetConfig().dlss_debug_view;
+  const bool motion_check = debug_view == 3;
+  ID3D11ShaderResourceView* const scene_srv =
+      in.effects_srv || motion_check ? SceneColorView(device, scene_source) : nullptr;
+  if (!scene_srv) in.effects_srv = nullptr;  // no reactive mask without the scene colour
   const bool capturing = !in.replay && capture::Active();
 
   const ComputeState saved(ctx);  // restored when leaving this function
   g_in_eval = true;
-  bool ok = debug_view != 0 || EnsureFeature(ctx, width, height);
-  if (!ok) {
+  if (debug_view == 0 && !EnsureFeature(ctx, g_t.w, g_t.h)) {
     g_in_eval = false;
     Fail();
     return false;
   }
-  if (ok) {
-    const float dx = cur.camera_pos[0] - g_prev.camera_pos[0];
-    const float dy = cur.camera_pos[1] - g_prev.camera_pos[1];
-    const float dz = cur.camera_pos[2] - g_prev.camera_pos[2];
-    const bool requested = g_reset || !g_have_prev;
-    const bool gap = !requested && g_prev.frame + 1 != cur.frame;
-    const bool size = !requested && (g_prev.width != cur.width || g_prev.height != cur.height);
-    const bool jump = !requested && dx * dx + dy * dy + dz * dz > kResetDistance * kResetDistance;
-    const bool reset = requested || gap || size || jump;
-    in.reset = reset;
-    g_stats.requested += requested;
-    g_stats.gap += gap;
-    g_stats.size += size;
-    g_stats.jump += jump;
-    ++g_stats.evaluated;
 
-    CsParams params = {};
-    CurToPrev(cur, reset ? cur : g_prev, params.cur_to_prev);
-    params.jitter_ndc[0] = 2.0f * cur.jitter_x / cur.width;
-    params.jitter_ndc[1] = -2.0f * cur.jitter_y / cur.height;
-    params.size[0] = cur.width;
-    params.size[1] = cur.height;
-    params.debug_view = static_cast<uint32_t>(debug_view);
-    params.use_object_motion = object_srv && !reset ? 1 : 0;
-    params.proj_z = cur.proj_z;
-    params.reactive = effects_srv && !reset ? reactive_strength : 0.0f;
-    params.jitter_px[0] = cur.jitter_x;
-    params.jitter_px[1] = cur.jitter_y;
-    params.prev_jitter_px[0] = reset ? cur.jitter_x : g_prev.jitter_x;
-    params.prev_jitter_px[1] = reset ? cur.jitter_y : g_prev.jitter_y;
-    ctx->UpdateSubresource(g_cb.Get(), 0, nullptr, &params, 0, 0);
+  const Reset reset = DecideReset(in.cur);
+  in.reset = reset.Any();
+  const CsParams params = MotionParams(in, in.reset, debug_view);
+  if (typeless) ctx->CopyResource(g_t.color_in.Get(), in.color);
+  WriteMotion(ctx, in, params, scene_srv, motion_check);
 
-    ctx->CopyResource(g_t.depth_copy.Get(), in.depth);
-    if (typeless) ctx->CopyResource(g_t.color_in.Get(), color);
-    ID3D11UnorderedAccessView* uavs[5] = {g_t.mv_uav.Get(), g_t.depth_uav.Get(),
-                                          g_t.out_uav.Get(), g_t.bias_uav.Get(),
-                                          g_t.object_uav.Get()};
-    ctx->CSSetShader(g_cs.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* srvs[5] = {
-        g_t.depth_srv.Get(), object_srv, effects_srv,
-        effects_srv || motion_check ? g_t.color_srv.Get() : nullptr,
-        motion_check ? g_t.prev_color_srv.Get() : nullptr};
-    ctx->CSSetShaderResources(0, 5, srvs);
-    if (motion_check) ctx->CSSetSamplers(0, 1, g_linear.GetAddressOf());
-    ctx->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-    ctx->CSSetConstantBuffers(0, 1, g_cb.GetAddressOf());
-    ctx->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-    UnbindCompute(ctx);
-    if (capturing) {
-      auto resource = [](ID3D11ShaderResourceView* srv) {
-        ComPtr<ID3D11Resource> r;
-        if (srv) srv->GetResource(&r);
-        return r;
-      };
-      capture::Grab(ctx, capture::kColor, scene_source);
-      capture::Grab(ctx, capture::kDepth, g_t.depth_copy.Get());
-      capture::Grab(ctx, capture::kObjectMotion, resource(object_srv).Get());
-      capture::Grab(ctx, capture::kEffects, resource(effects_srv).Get());
-      capture::Grab(ctx, capture::kMotion, g_t.mv.Get());
-      capture::Grab(ctx, capture::kBias, g_t.bias.Get());
-      capture::Grab(ctx, capture::kObject, g_t.object.Get());
-    }
-    if (in.motion_out) ctx->CopyResource(in.motion_out, g_t.mv.Get());
-    if (in.bias_out) ctx->CopyResource(in.bias_out, g_t.bias.Get());
-    if (in.object_out) ctx->CopyResource(in.object_out, g_t.object.Get());
-    if (!in.replay) {
-      if (object_srv) object_motion::Clear(ctx);  // the next frame's velocity pass refills it
-      if (effects_srv) reactive::Clear(ctx);
-    }
-    if (motion_check) ctx->CopyResource(g_t.prev_color.Get(), scene_source);
-
-    double ms = in.frame_ms;
-    if (ms <= 0.0) {
-      LARGE_INTEGER now, freq;
-      QueryPerformanceCounter(&now);
-      QueryPerformanceFrequency(&freq);
-      ms = g_last_eval.QuadPart ? 1000.0 * (now.QuadPart - g_last_eval.QuadPart) / freq.QuadPart
-                                : 16.7;
-      g_last_eval = now;
-    }
-    if (debug_view != 0) {
-      g_debug_frame = !in.replay;  // drawn over the finished frame at Present
-      if (in.replay) ctx->CopyResource(color, g_t.out.Get());  // a replay gets it as the frame
-    } else {
-      ID3D11Resource* input = typeless ? g_t.color_in.Get() : color;  // copied above
-      NVSDK_NGX_D3D11_DLSS_Eval_Params e = {};
-      e.Feature.pInColor = input;
-      e.Feature.pInOutput = g_t.out.Get();
-      e.pInDepth = g_t.depth.Get();
-      e.pInMotionVectors = g_t.mv.Get();
-      e.InJitterOffsetX = GetConfig().dlss_jitter_sign * cur.jitter_x;
-      e.InJitterOffsetY = GetConfig().dlss_jitter_sign * cur.jitter_y;
-      e.InRenderSubrectDimensions.Width = width;
-      e.InRenderSubrectDimensions.Height = height;
-      e.InReset = reset ? 1 : 0;
-      e.InMVScaleX = 1.0f;
-      e.InMVScaleY = 1.0f;
-      if (params.reactive > 0.0f) e.pInBiasCurrentColorMask = g_t.bias.Get();
-      const NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_feature, g_params, &e);
-      ok = NVSDK_NGX_SUCCEED(r);
-      if (ok) {
-        ctx->CopyResource(color, g_t.out.Get());
-        g_eval_failures = 0;
-      } else {
-        char message[64];
-        std::snprintf(message, sizeof(message), "DLSS evaluate failed: 0x%08X", r);
-        Warn(kWarnEvaluate, message);
-      }
-    }
-    if (capturing) {
-      if (ok && debug_view == 0) capture::Grab(ctx, capture::kOutput, color);
-      const bool reasons[4] = {requested, gap, size, jump};
-      capture::Finish(ctx, FrameRecord(in, params, reasons, ms, ok, debug_view).c_str());
-    }
-    g_reset = false;
-    g_prev = cur;
-    g_have_prev = true;
+  if (capturing) GrabInputs(ctx, in, scene_source);
+  if (in.motion_out) ctx->CopyResource(in.motion_out, g_t.mv.Get());
+  if (in.bias_out) ctx->CopyResource(in.bias_out, g_t.bias.Get());
+  if (in.object_out) ctx->CopyResource(in.object_out, g_t.object.Get());
+  if (!in.replay) {
+    if (in.object_srv) object_motion::Clear(ctx);  // the next frame's velocity pass refills it
+    if (in.effects_srv) reactive::Clear(ctx);
   }
+  if (motion_check) ctx->CopyResource(g_t.prev_color.Get(), scene_source);
+
+  const double ms = FrameMs(in);
+  bool ok = true;
+  if (debug_view != 0) {
+    g_debug_frame = !in.replay;  // drawn over the finished frame at Present
+    if (in.replay) ctx->CopyResource(in.color, g_t.out.Get());  // a replay gets it as the frame
+  } else {
+    ok = RunDlss(ctx, in, scene_source, params.reactive > 0.0f, in.reset);
+  }
+  if (capturing) {
+    if (ok && debug_view == 0) capture::Grab(ctx, capture::kOutput, in.color);
+    const bool reasons[4] = {reset.requested, reset.gap, reset.size, reset.jump};
+    capture::Finish(ctx, FrameRecord(in, params, reasons, ms, ok, debug_view).c_str());
+  }
+  g_reset = false;
+  g_prev = in.cur;
+  g_have_prev = true;
 
   g_in_eval = false;
   if (!ok && ++g_eval_failures >= 30) {
@@ -685,7 +570,65 @@ void Evaluate(ID3D11DeviceContext* ctx, ID3D11Texture2D* color) {
 
   capture::BeginFrame(cur.frame);
   FrameInputs in = {color, depth.Get(), cur, object_srv, effects_srv, 0.0f, false};
+  g_processed = true;
   Process(ctx, device.Get(), in, typeless);
+}
+
+// Called every Present: whether the next frame gets the camera jitter.
+bool NextFrameJitter(bool running) {
+  const bool jitter = running && g_processed;
+  if (running && g_jittering && !jitter && g_jitter_pauses < 20) {
+    ++g_jitter_pauses;
+    Log("DLAA: the scene was not processed this frame, jitter paused until it is again");
+  }
+  g_processed = false;
+  g_jittering = jitter;
+  return jitter;
+}
+
+// Called every Present. Once a minute (3600 presents): the feature counters,
+// and how many velocity draws were repeated in each of the next 8 frames (a
+// count that drops to 0 every other frame would make characters flicker).
+// Every 60 presents: history resets, if any (at most 300 lines per session).
+struct LogState {
+  uint32_t presents = 0;
+  uint32_t velocity_draws[8] = {};
+  uint32_t sampled = 8;  // frames of velocity_draws filled; 8 = not sampling
+  uint32_t window = 0;   // presents since the last reset summary
+  uint32_t reset_lines = 0;
+} g_log;
+
+void LogStatistics(bool running) {
+  auto& [presents, velocity_draws, sampled, window, reset_lines] = g_log;
+
+  // Taken every frame so each count covers exactly one frame.
+  const uint32_t redraws = object_motion::TakeRedrawCount();
+  const uint32_t effect_draws = reactive::TakeRedrawCount();
+  const uint32_t view_uploads = camera::TakeViewUploadCount();
+  if (running && presents % 3600 == 0) {
+    Log("reactive mask: %u effect draws last frame", effect_draws);
+    Log("jitter: %u cbMatrixWVP uploads jittered last frame", view_uploads);
+    Log("mip bias: %u samplers have a biased twin", mip_bias::TwinCount());
+  }
+  if (running && ++presents % 3600 == 1) sampled = 0;
+  if (sampled < 8) {
+    velocity_draws[sampled++] = redraws;
+    if (sampled == 8)
+      Log("object motion: velocity draws in 8 frames: %u %u %u %u %u %u %u %u", velocity_draws[0],
+          velocity_draws[1], velocity_draws[2], velocity_draws[3], velocity_draws[4],
+          velocity_draws[5], velocity_draws[6], velocity_draws[7]);
+  }
+
+  if (++window < 60) return;
+  const uint32_t resets = g_stats.requested + g_stats.gap + g_stats.size + g_stats.jump;
+  if (running && resets > 0 && reset_lines < 300) {
+    ++reset_lines;
+    Log("DLAA: %u history resets in the last 60 presents (requested %u, frame gap %u, size %u, "
+        "camera jump %u), %u frames evaluated",
+        resets, g_stats.requested, g_stats.gap, g_stats.size, g_stats.jump, g_stats.evaluated);
+  }
+  window = 0;
+  g_stats = {};
 }
 
 }  // namespace
@@ -752,43 +695,12 @@ void OnPresent(IDXGISwapChain* swap_chain) {
     g_debug_frame = false;
   }
   g_running.store(running, std::memory_order_relaxed);
-  camera::SetDlssJitter(running);
+  camera::SetDlssJitter(NextFrameJitter(running));
   mip_bias::OnPresent(running);
   object_motion::SetActive(running && GetConfig().dlss_object_motion);
   const bool reactive_on = running && GetConfig().dlss_reactive > 0.0f;
   reactive::SetActive(reactive_on);
-  // Once a minute: how many velocity draws were repeated in each of 8 frames
-  // (a count that drops to 0 every other frame would make characters flicker).
-  static uint32_t presents = 0;
-  static uint32_t counts[8];
-  static uint32_t counted = 8;
-  const uint32_t redraws = object_motion::TakeRedrawCount();
-  const uint32_t effect_draws = reactive::TakeRedrawCount();
-  const uint32_t view_uploads = camera::TakeViewUploadCount();
-  if (running && presents % 3600 == 0) {
-    Log("reactive mask: %u effect draws last frame", effect_draws);
-    Log("jitter: %u cbMatrixWVP uploads jittered last frame", view_uploads);
-    Log("mip bias: %u samplers have a biased twin", mip_bias::TwinCount());
-  }
-  if (running && ++presents % 3600 == 1) counted = 0;
-  if (counted < 8) {
-    counts[counted++] = redraws;
-    if (counted == 8)
-      Log("object motion: velocity draws in 8 frames: %u %u %u %u %u %u %u %u", counts[0],
-          counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]);
-  }
-  // Every 60 presents: history resets, if any (at most 300 lines per session).
-  static uint32_t window = 0, reset_lines = 0;
-  if (++window < 60) return;
-  const uint32_t resets = g_stats.requested + g_stats.gap + g_stats.size + g_stats.jump;
-  if (running && resets > 0 && reset_lines < 300) {
-    ++reset_lines;
-    Log("DLAA: %u history resets in the last 60 presents (requested %u, frame gap %u, size %u, "
-        "camera jump %u), %u frames evaluated",
-        resets, g_stats.requested, g_stats.gap, g_stats.size, g_stats.jump, g_stats.evaluated);
-  }
-  window = 0;
-  g_stats = {};
+  LogStatistics(running);
 }
 
 }  // namespace ds3::dlaa

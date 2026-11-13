@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 
+#include "common/context_table.h"
 #include "core.h"
 
 using Microsoft::WRL::ComPtr;
@@ -12,18 +13,15 @@ using Microsoft::WRL::ComPtr;
 namespace ds3::reactive {
 namespace {
 
-// What each context currently has bound. A context is only used by one thread
-// at a time, so its slot needs no further locking.
-struct ContextSlot {
-  std::atomic<ID3D11DeviceContext*> ctx{nullptr};
+// What a context currently has bound.
+struct OutputState {
   // Target 0 is the HDR scene and target 1 is bound too: DS3's forward and
   // transparent passes. (Deferred lighting writes the scene alone.)
   std::atomic<bool> scene{false};
   std::atomic<bool> blend{false};   // blending on target 0
   std::atomic<bool> writes{true};   // depth or stencil writes
 };
-constexpr size_t kMaxContexts = 64;
-ContextSlot g_contexts[kMaxContexts];
+ContextTable<OutputState> g_contexts("reactive mask");
 
 std::atomic<ID3D11Resource*> g_scene{nullptr};
 std::atomic<bool> g_active{false};
@@ -38,19 +36,6 @@ struct Resources {
   ComPtr<ID3D11RenderTargetView> rtv;
   ComPtr<ID3D11ShaderResourceView> srv;
 } g_res;
-
-ContextSlot* FindSlot(ID3D11DeviceContext* ctx, bool create) {
-  for (ContextSlot& s : g_contexts) {
-    ID3D11DeviceContext* owner = s.ctx.load(std::memory_order_acquire);
-    if (owner == ctx) return &s;
-    if (!owner) {
-      if (!create) return nullptr;
-      if (s.ctx.compare_exchange_strong(owner, ctx)) return &s;
-      if (owner == ctx) return &s;
-    }
-  }
-  return nullptr;
-}
 
 }  // namespace
 
@@ -68,8 +53,8 @@ void OnSetRenderTargets(ID3D11DeviceContext* ctx, UINT count,
     scene = resource == want;
     if (resource) resource->Release();
   }
-  ContextSlot* slot = FindSlot(ctx, true);
-  if (slot) slot->scene.store(scene, std::memory_order_relaxed);
+  if (OutputState* state = g_contexts.FindOrAdd(ctx))
+    state->scene.store(scene, std::memory_order_relaxed);
 }
 
 void OnSetBlendState(ID3D11DeviceContext* ctx, ID3D11BlendState* blend) {
@@ -79,37 +64,37 @@ void OnSetBlendState(ID3D11DeviceContext* ctx, ID3D11BlendState* blend) {
     blend->GetDesc(&d);
     on = d.RenderTarget[0].BlendEnable != FALSE;
   }
-  ContextSlot* slot = FindSlot(ctx, true);
-  if (slot) slot->blend.store(on, std::memory_order_relaxed);
+  if (OutputState* state = g_contexts.FindOrAdd(ctx))
+    state->blend.store(on, std::memory_order_relaxed);
 }
 
-void OnSetDepthStencilState(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* state) {
+void OnSetDepthStencilState(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* depth_state) {
   bool writes = true;  // the default state writes depth
-  if (state) {
+  if (depth_state) {
     D3D11_DEPTH_STENCIL_DESC d;
-    state->GetDesc(&d);
+    depth_state->GetDesc(&d);
     writes = (d.DepthEnable && d.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO) ||
              (d.StencilEnable && d.StencilWriteMask != 0);
   }
-  ContextSlot* slot = FindSlot(ctx, true);
-  if (slot) slot->writes.store(writes, std::memory_order_relaxed);
+  if (OutputState* state = g_contexts.FindOrAdd(ctx))
+    state->writes.store(writes, std::memory_order_relaxed);
 }
 
 void OnResetState(ID3D11DeviceContext* ctx) {
-  ContextSlot* slot = FindSlot(ctx, false);
-  if (!slot) return;
-  slot->scene.store(false, std::memory_order_relaxed);
-  slot->blend.store(false, std::memory_order_relaxed);
-  slot->writes.store(true, std::memory_order_relaxed);
+  OutputState* state = g_contexts.Find(ctx);
+  if (!state) return;
+  state->scene.store(false, std::memory_order_relaxed);
+  state->blend.store(false, std::memory_order_relaxed);
+  state->writes.store(true, std::memory_order_relaxed);
 }
 
 bool WantsRedraw(ID3D11DeviceContext* ctx) {
   if (!g_active.load(std::memory_order_relaxed) || !g_ready.load(std::memory_order_relaxed))
     return false;
-  const ContextSlot* slot = FindSlot(ctx, false);
-  return slot && slot->scene.load(std::memory_order_relaxed) &&
-         slot->blend.load(std::memory_order_relaxed) &&
-         !slot->writes.load(std::memory_order_relaxed);
+  const OutputState* state = g_contexts.Find(ctx);
+  return state && state->scene.load(std::memory_order_relaxed) &&
+         state->blend.load(std::memory_order_relaxed) &&
+         !state->writes.load(std::memory_order_relaxed);
 }
 
 bool Begin(ID3D11DeviceContext* ctx, SavedTargets* s) {
@@ -146,16 +131,8 @@ bool Prepare(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UINT h) {
   g_ready = false;
   g_res = Resources{};
   // Blendable float, like the HDR scene.
-  D3D11_TEXTURE2D_DESC d = {};
-  d.Width = w;
-  d.Height = h;
-  d.MipLevels = 1;
-  d.ArraySize = 1;
-  d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  d.SampleDesc.Count = 1;
-  d.Usage = D3D11_USAGE_DEFAULT;
-  d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-  HRESULT hr = device->CreateTexture2D(&d, nullptr, &g_res.target);
+  HRESULT hr = MakeTexture(device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g_res.target);
   if (SUCCEEDED(hr)) hr = device->CreateRenderTargetView(g_res.target.Get(), nullptr, &g_res.rtv);
   if (SUCCEEDED(hr))
     hr = device->CreateShaderResourceView(g_res.target.Get(), nullptr, &g_res.srv);

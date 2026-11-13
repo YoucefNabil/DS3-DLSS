@@ -31,20 +31,20 @@ uint8_t* Find(Range range, const uint8_t* pattern, const char* mask, uint8_t* fr
   return nullptr;
 }
 
-void Write(void* address, const void* bytes, size_t size) {
+bool Write(void* address, const void* bytes, size_t size) {
   DWORD old = 0;
-  VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &old);
+  if (!VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &old)) return false;
   std::memcpy(address, bytes, size);
   VirtualProtect(address, size, old, &old);
   FlushInstructionCache(GetCurrentProcess(), address, size);
+  return true;
 }
 
 bool Redirect(uint8_t* disp, const void* target) {
   const intptr_t distance = static_cast<const uint8_t*>(target) - (disp + 4);
   if (distance != static_cast<int32_t>(distance)) return false;
   const int32_t value = static_cast<int32_t>(distance);
-  Write(disp, &value, sizeof(value));
-  return true;
+  return Write(disp, &value, sizeof(value));
 }
 
 void* AllocateNear(const void* near_address, size_t size) {
@@ -85,9 +85,10 @@ bool HookImport(uint8_t* base, const char* dll, const char* function, void* hook
       if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
       const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
       if (std::strcmp(by_name->Name, function) != 0) continue;
-      *original = reinterpret_cast<void*>(slots->u1.Function);
       const ULONG_PTR value = reinterpret_cast<ULONG_PTR>(hook);
-      Write(&slots->u1.Function, &value, sizeof(value));
+      void* const previous = reinterpret_cast<void*>(slots->u1.Function);
+      if (!Write(&slots->u1.Function, &value, sizeof(value))) return false;
+      *original = previous;
       return true;
     }
   }

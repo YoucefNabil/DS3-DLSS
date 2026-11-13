@@ -26,10 +26,11 @@ inline uint8_t* RipTarget(uint8_t* disp, int tail = 0) {
 }
 
 // Writes bytes into code (or read-only data) and flushes the instruction cache.
-void Write(void* address, const void* bytes, size_t size);
+// False when the page could not be made writable: nothing was written.
+bool Write(void* address, const void* bytes, size_t size);
 
 // Points the rip-relative operand at disp to target. False when target is
-// out of +-2 GB reach.
+// out of +-2 GB reach or the write failed: the operand is unchanged.
 bool Redirect(uint8_t* disp, const void* target);
 
 // size bytes of read/write memory within 2 GB of near (for Redirect).

@@ -50,6 +50,8 @@ namespace {
 
 constexpr UINT kW = 640, kH = 360;
 constexpr float kDepth = 0.99f;  // cleared scene depth
+// "edge": alpha the scene is cleared to; DLAA must leave it alone.
+constexpr float kSceneAlpha = 0.25f;
 // "ghost": mean colour error allowed on and behind the quad.
 constexpr double kGhostInsideLimit = 0.08, kGhostBehindLimit = 0.09;
 constexpr float kNear = 0.08f, kProj10 = 1.00001f;
@@ -625,7 +627,8 @@ int wmain(int argc, wchar_t** argv) {
     ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                shimmer ? kShimmerFarDepth : kDepth, 0);
     const float grey[4] = {0.5f, 0.5f, 0.5f, 1.0f};
-    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // The game's scene alpha carries data and must come back unchanged.
+    const float black[4] = {0.0f, 0.0f, 0.0f, kSceneAlpha};
     ctx->ClearRenderTargetView(scene_rtv, edge || shimmer ? black : grey);
     const D3D11_VIEWPORT viewport = {0, 0, kW, kH, 0, 1};
     if (object) {
@@ -859,6 +862,11 @@ int wmain(int argc, wchar_t** argv) {
                                                           (kH / 2) * m.RowPitch);
       std::printf("edge: white %.4f, black %.4f\n", HalfToFloat(mid[10 * 4]),
                   HalfToFloat(mid[(kW - 10) * 4]));
+      const float alpha = HalfToFloat(mid[(kW - 10) * 4 + 3]);
+      const bool alpha_kept = std::fabs(alpha - kSceneAlpha) < 0.001f;
+      std::printf("edge: scene alpha %.4f after DLAA (the game's was %.4f) %s\n", alpha,
+                  kSceneAlpha, alpha_kept ? "ok" : "MISMATCH");
+      if (!alpha_kept) ++failures;
       ctx->Unmap(staging, 0);
       std::printf("edge: mean error on %d edge pixels = %.4f, whole image = %.5f\n", edge_pixels,
                   edge_sum / edge_pixels, sum / (kW * kH));

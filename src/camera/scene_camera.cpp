@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 
 #include "common/config.h"
@@ -32,6 +33,7 @@ std::atomic<uint32_t> g_view_uploads{0};
 std::atomic<float> g_screen_w{0.0f}, g_screen_h{0.0f};
 std::atomic<float> g_output_w{0.0f}, g_output_h{0.0f};  // swap chain
 std::atomic<bool> g_logged_small{false};
+std::atomic<bool> g_logged_map_full{false};
 
 // Map/Unmap of cbMatrixWVP buffers, finished at Unmap.
 std::mutex g_map_mutex;
@@ -45,15 +47,6 @@ PendingMap g_maps[8];
 std::mutex g_snapshot_mutex;
 Snapshot g_snapshot;
 bool g_have_snapshot = false;
-
-float Halton(uint32_t index, uint32_t base) {
-  float f = 1.0f, r = 0.0f;
-  for (; index; index /= base) {
-    f /= static_cast<float>(base);
-    r += f * static_cast<float>(index % base);
-  }
-  return r;
-}
 
 // Perspective view whose aspect matches the screen. Shadow cascades are
 // orthographic, and the other perspective views (e.g. 512x512 spot/env maps)
@@ -78,15 +71,6 @@ void JitterMatrix(float* m, float jx, float jy) {
 // inv' = inv * J^-1
 void JitterInverse(float* m, float jx, float jy) {
   for (int r = 0; r < 4; ++r) m[r * 4 + 3] -= jx * m[r * 4] + jy * m[r * 4 + 1];
-}
-
-UINT ConstantBufferBytes(ID3D11Resource* r) {
-  D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-  r->GetType(&dim);
-  if (dim != D3D11_RESOURCE_DIMENSION_BUFFER) return 0;
-  D3D11_BUFFER_DESC d;
-  static_cast<ID3D11Buffer*>(r)->GetDesc(&d);
-  return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) ? d.ByteWidth : 0;
 }
 
 bool Near(float a, float b, float tolerance) { return std::fabs(a - b) <= tolerance; }
@@ -119,6 +103,18 @@ bool FrameJitter(float* ox, float* oy) {
   *ox = (Halton(n, 2) - 0.5f) * scale;
   *oy = (Halton(n, 3) - 0.5f) * scale;
   return true;
+}
+
+// A copy of a cbSceneParam in `scratch` with the NDC jitter in all four of its
+// camera matrices.
+const void* JitteredSceneCb(const void* data, void* scratch, float jx, float jy) {
+  std::memcpy(scratch, data, kSceneCbBytes);
+  float* cb = static_cast<float*>(scratch);
+  JitterMatrix(cb + kProj, jx, jy);
+  JitterMatrix(cb + kViewProj, jx, jy);
+  JitterInverse(cb + kInvProj, jx, jy);
+  JitterInverse(cb + kInvViewProj, jx, jy);
+  return scratch;
 }
 
 // Jitters a main-camera cbMatrixWVP in place, like cbSceneParam's ViewProj, so
@@ -185,15 +181,7 @@ const void* OnConstantUpload(ID3D11Resource* dst, const D3D11_BOX* box, const vo
     const float w = g_screen_w.load(std::memory_order_relaxed);
     const float h = g_screen_h.load(std::memory_order_relaxed);
     if (!(w > 0.0f && h > 0.0f) || !FrameJitter(&ox, &oy)) return data;
-    std::memcpy(scratch, data, kSceneCbBytes);
-    float* cb = static_cast<float*>(scratch);
-    const float jx = 2.0f * ox / w;
-    const float jy = -2.0f * oy / h;
-    JitterMatrix(cb + kProj, jx, jy);
-    JitterMatrix(cb + kViewProj, jx, jy);
-    JitterInverse(cb + kInvProj, jx, jy);
-    JitterInverse(cb + kInvViewProj, jx, jy);
-    return scratch;
+    return JitteredSceneCb(data, scratch, 2.0f * ox / w, -2.0f * oy / h);
   }
   g_screen_w.store(in[kScreenSize], std::memory_order_relaxed);
   g_screen_h.store(in[kScreenSize + 1], std::memory_order_relaxed);
@@ -203,28 +191,26 @@ const void* OnConstantUpload(ID3D11Resource* dst, const D3D11_BOX* box, const vo
     return data;
   }
   Remember(in, frame, ox, oy);
-
-  std::memcpy(scratch, data, kSceneCbBytes);
-  float* cb = static_cast<float*>(scratch);
-  const float jx = 2.0f * ox / cb[kScreenSize];
-  const float jy = -2.0f * oy / cb[kScreenSize + 1];
-  JitterMatrix(cb + kProj, jx, jy);
-  JitterMatrix(cb + kViewProj, jx, jy);
-  JitterInverse(cb + kInvProj, jx, jy);
-  JitterInverse(cb + kInvViewProj, jx, jy);
-  return scratch;
+  return JitteredSceneCb(data, scratch, 2.0f * ox / in[kScreenSize],
+                         -2.0f * oy / in[kScreenSize + 1]);
 }
 
 void OnMap(ID3D11DeviceContext* ctx, ID3D11Resource* r, D3D11_MAP type, void* data) {
   const Config& cfg = GetConfig();
   if (!(cfg.jitter || cfg.dlss) || !data || type != D3D11_MAP_WRITE_DISCARD) return;
   if (ConstantBufferBytes(r) != kViewCbBytes) return;
-  std::lock_guard lock(g_map_mutex);
-  for (PendingMap& m : g_maps) {
-    if (m.data) continue;
-    m = {ctx, r, static_cast<float*>(data)};
-    return;
+  {
+    std::lock_guard lock(g_map_mutex);
+    for (PendingMap& m : g_maps) {
+      if (m.data) continue;
+      m = {ctx, r, static_cast<float*>(data)};
+      return;
+    }
   }
+  // This buffer goes to the GPU unjittered: whatever draws with it flickers.
+  if (!g_logged_map_full.exchange(true))
+    Log("jitter: more than %zu cbMatrixWVP buffers mapped at once, the extra ones are not "
+        "jittered (logged once)", std::size(g_maps));
 }
 
 void OnUnmap(ID3D11DeviceContext* ctx, ID3D11Resource* r) {

@@ -34,7 +34,8 @@ add_library(ds3_dlss SHARED
 dlaa_core_add_mod(ds3_dlss SHADERS mv_from_depth object_motion_ps)
 
 # Standalone smoke test: loads the built proxy and drives device/swap-chain creation.
-add_executable(smoke_test tests/smoke_test.cpp)
+# tests/smoke_test.cpp from dlaa-core: drives the built proxy.
+add_executable(smoke_test ${DLAA_CORE_DIR}/tests/smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE dxgi d3dcompiler)
 
 # DLAA path test with a synthetic DS3-like frame (needs the game's dumped PS 393A947C35535471).

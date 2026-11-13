@@ -45,7 +45,12 @@ void OnSetDepthStencilState(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* s
   reactive::OnSetDepthStencilState(ctx, state);
 }
 
-void OnResetState(ID3D11DeviceContext* ctx) { reactive::OnResetState(ctx); }
+// ClearState, or a command list finished or executed without restoring state:
+// the context is back to defaults, with no shaders bound.
+void OnResetState(ID3D11DeviceContext* ctx) {
+  reactive::OnResetState(ctx);
+  object_motion::OnSetVertexShader(ctx, nullptr);
+}
 
 uint32_t BeforeDraw(ID3D11DeviceContext* ctx, const hooks::DrawArgs& args) {
   if (args.kind == hooks::DrawArgs::kDraw) dlaa::BeforeDraw(ctx);
